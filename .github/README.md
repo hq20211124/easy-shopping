@@ -266,10 +266,35 @@ macOS 200 分钟/月）。它单次正常耗时约 **5～10 分钟**，主要成
 
 > 补充：`ios-smoke`（`.github/workflows/ios-smoke.yml`）在 macOS runner 上真实启动模拟器、装 App、运行并截图，验证的是**"启动不崩 + 根视图渲染 + 网络失败有可见错误态"**。判定用两级强信号（`simctl launch` 退出码、`launchctl` 中进程是否仍在），**fail-closed**——宁可假红也不能假绿。截图只作参考信号，不参与判定。触发为 `workflow_dispatch` + 仅 `ios-client/**` 变更的 push/PR + 每周一 schedule（约 60 分钟/月额度，删掉 `schedule:` 即可停）。
 
+### 7.1 iOS 运行态冒烟的实战教训（2026-10-12，6 轮才绿）
+
+首次启用时连续 6 次运行失败，**但每次 `xcodebuild` 都是 `BUILD SUCCEEDED`**——问题全在编排脚本。已全部修复，记录在此以免重蹈：
+
+| # | 症状 | 真因 |
+|---|------|------|
+| 1 | 整份 workflow **0 秒失败、不创建任何 job、无日志** | `jobs.<id>.env` 里引用 `inputs.*` / `runner.*`——这两个上下文**只在 step 级可用**，GitHub 在加载期就判无效（本地 YAML 解析完全正常，极具迷惑性） |
+| 2 | 14 秒全链失败，`install.rc=99` 等"未执行"默认值 | `$GITHUB_ENV` **只对后续步骤生效**，同一步内 `mkdir "$WORK"` 是空路径 |
+| 3 | 中段步骤被整段跳过，现场全丢 | 原文件**零个** `continue-on-error`，与文件头声明的"判定统一收在最后一步"相悖 |
+| 4 | `xcodebuild: error: missing value for key 'id' of option 'Destination'` | 编译步骤漏加载 `state/sim.env`（→ `$UDID` 空）+ 缺 `working-directory: ios-client`（`.xcodeproj` 由 xcodegen 现场生成在子目录） |
+| 5 | 产物明明在、`BUILD SUCCEEDED`，却报"没有可安装产物" | `WRAPPER_NAME` 本身已含 `.app`，代码又拼一次 → `EasyShopping.app.app`；连锁引发下游 `set -u` 下 unbound variable |
+| 6 | install/launch/存活/截图全绿，判定仍失败 | "产物是否就位"被 bundle id 解析**连坐**——bundle id 只影响 launch 目标，不该拖垮主判据 |
+
+**四条通用原则**（均已落到 workflow 注释里）：
+
+1. **本地 YAML 合法 ≠ GitHub 接受**。`inputs` / `runner` / `secrets` 等上下文有严格的可用位置限制。
+2. **`$GITHUB_ENV` 只影响后续步骤**，同一步骤内别指望它。
+3. **判据必须与 best-effort 的辅助解析解耦**，否则一个辅助步骤失败会让真实结果不可见。
+4. **失败时一定要留证据**。第 3 轮补的 `continue-on-error` 是后面 3 轮能精确定位的前提——没有它，每轮都只会得到一句 `Process completed with exit code 1`。
+
+### 7.2 绿灯的正确读法
+
+> 补充：`ios-smoke`（`.github/workflows/ios-smoke.yml`）在 macOS runner 上真实启动模拟器、装 App、运行并截图，验证的是**"启动不崩 + 根视图渲染 + 网络失败有可见错误态"**。判定用两级强信号（`simctl launch` 退出码、`launchctl` 中进程是否仍在），**fail-closed**——宁可假红也不能假绿。截图只作参考信号，不参与判定。触发为 `workflow_dispatch` + 仅 `ios-client/**` 变更的 push/PR + 每周一 schedule（约 60 分钟/月额度，删掉 `schedule:` 即可停）。
+
 避免误读绿灯：
 
-- ❌ iOS **UI 自动化断言**——`ios-smoke`（见下）验证的是"能装、能启动、进程还活着、能截图"，**不是**像素级/可访问性树断言（无 XCUITest target，取不到可访问性树，用颜色阈值假装断言只会制造假红假绿）。
-  - `ios-macos`（编译）与 `ios-smoke`（运行）是两个独立 workflow；后者覆盖不了 iOS 16 特有行为——runner 上是最新 runtime（当前 iOS 18.x），且 Xcode 16 已不自带 iOS 16 模拟器。
+- ❌ iOS **UI 自动化断言**——`ios-smoke` 验证的是"能装、能启动、进程还活着、能截图"，**不是**像素级/可访问性树断言（无 XCUITest target，取不到可访问性树，用颜色阈值假装断言只会制造假红假绿）。
+  - 已验证到的程度（2026-10-12 首次绿）：截图显示根视图正常渲染（标题/搜索框/四 Tab），且 CI 无后端时首页呈现**"网络异常：无法连接服务器。"+ 重试按钮**的可见错误态——正是审计要求的"静默失败治理"在运行期的实证。
+  - `ios-macos`（编译）与 `ios-smoke`（运行）是两个独立 workflow；后者覆盖不了 iOS 16 特有行为——runner 上是最新 runtime（当前 iOS 26.x），且 Xcode 16 已不自带 iOS 16 模拟器。
 - ❌ **真实中间件**：e2e-smoke 跑的仍是 H2 文件库 + 进程内事件分发（`server/` 的 P0 形态），
   **不是** MySQL 16 库 64 分片 + RabbitMQ（生产演进形态，见 `plans/00-架构总纲.md`）。
   所以它验的是「跨服务**代码契约**」，不是「跨中间件的部署契约」。
