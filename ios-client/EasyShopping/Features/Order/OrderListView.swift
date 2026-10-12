@@ -6,7 +6,11 @@ struct OrderListView: View {
     let initialStatus: Int?
 
     @EnvironmentObject private var router: AppRouter
-    @StateObject private var vm = OrderListViewModel()
+    // 单点初始化：与 OrderDetailView / CheckoutView / PayView 写法一致。
+    // （旧写法 `@StateObject private var vm = OrderListViewModel()` 再在 init 里
+    //  `_vm = StateObject(wrappedValue: {...}())`，属于双重初始化属性包装器 backing store：
+    //  每次构造 View 都会白建一个 VM 对象再丢弃。）
+    @StateObject private var vm: OrderListViewModel
     @State private var pendingCancel: OrderListItem?
 
     init(initialStatus: Int?) {

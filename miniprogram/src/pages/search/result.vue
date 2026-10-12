@@ -21,6 +21,8 @@ const total = ref(0)
 const nextCursor = ref<string | null>(null)
 const loading = ref(false)
 const initialized = ref(false)
+/** 加载失败：区分「没搜到」与「搜索接口挂了」，避免失败时显示"暂无结果"误导用户 */
+const failed = ref(false)
 
 const sorts = [
   { label: '综合', value: 'default' },
@@ -36,6 +38,7 @@ async function fetchPage(reset: boolean) {
   if (loading.value) return
   if (!reset && !nextCursor.value) return
   loading.value = true
+  if (reset) failed.value = false
   try {
     const res = await searchApi.products({
       q: keyword.value,
@@ -51,7 +54,12 @@ async function fetchPage(reset: boolean) {
     nextCursor.value = res.nextCursor
     initialized.value = true
   } catch {
+    // toast 已由请求层统一弹出；首页加载失败时置错误态（翻页失败保留已有结果，不清空）
     initialized.value = true
+    if (reset) {
+      list.value = []
+      failed.value = true
+    }
   } finally {
     loading.value = false
   }
@@ -120,7 +128,15 @@ onReachBottom(() => fetchPage(false))
       <text v-if="initialized">共 {{ total }} 件商品</text>
     </view>
 
-    <ec-empty v-if="finished && !list.length" text="没有找到相关商品" />
+    <ec-empty
+      v-if="failed && !list.length"
+      icon="📡"
+      text="搜索结果加载失败，请检查网络后重试"
+      action-text="重新搜索"
+      @action="fetchPage(true)"
+    />
+
+    <ec-empty v-else-if="finished && !list.length" text="没有找到相关商品" />
 
     <view class="result__list">
       <view v-for="item in list" :key="item.spuId" class="result__item" @click="goDetail(item.spuId)">

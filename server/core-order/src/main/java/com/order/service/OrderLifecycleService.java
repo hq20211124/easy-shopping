@@ -6,6 +6,7 @@ import com.easyshopping.common.event.DomainEventNames;
 import com.easyshopping.common.event.DomainEventPublisher;
 import com.order.client.InventoryClient;
 import com.order.client.PaymentClient;
+import com.order.client.PromotionClient;
 import com.order.domain.OrderMain;
 import com.order.domain.OrderStatus;
 import com.order.domain.OrderStatusLog.Operator;
@@ -25,11 +26,16 @@ import java.util.Map;
  * 订单生命周期操作：支付回调 / 买家取消 / 确认收货 / 后台发货 / 后台关闭 / 超时关单。
  *
  * <p>所有状态变更走 {@link OrderStateMachine#transition} 唯一入口；本服务负责
- * 业务前置校验、库存联动（core-inventory）、资金处置（core-payment TODO）与领域事件。</p>
+ * 业务前置校验、库存联动（core-inventory）、优惠券退回（core-promotion）、
+ * 资金处置（core-payment）与领域事件。</p>
  *
  * <p><b>关单与支付回调竞态（android-backend 4.2.4）</b>：以订单 {@code version} CAS 裁决，先到者胜——
  * 超时关单赢 → 订单保持已取消，迟到的成功回调触发原路退款（不得回写为已支付）；
  * 支付回调赢 → 关单扫描重读发现非待付款，静默跳过、不释放库存。</p>
+ *
+ * <p><b>关单补偿三件套</b>：释放库存（inventory 幂等）、退回优惠券（promotion 幂等）、
+ * 已支付则原路退款（payment 幂等）。三者失败<b>一律只告警不回滚关单</b>——
+ * 订单状态已流转是不可逆事实，补偿失败由对账兜底（admin-backend 13.2.2）。</p>
  */
 @Service
 public class OrderLifecycleService {
@@ -57,19 +63,23 @@ public class OrderLifecycleService {
     private final OrderMainRepository orderMainRepository;
     private final OrderStateMachine stateMachine;
     private final InventoryClient inventoryClient;
+    private final PromotionClient promotionClient;
     private final PaymentClient paymentClient;
     private final DomainEventPublisher eventPublisher;
     private final TransactionTemplate txTemplate;
 
+    /** public 构造器（测试需注入真实 {@code RestPaymentClient} + mock RestClient 断言退款报文）。 */
     public OrderLifecycleService(OrderMainRepository orderMainRepository,
                                  OrderStateMachine stateMachine,
                                  InventoryClient inventoryClient,
+                                 PromotionClient promotionClient,
                                  PaymentClient paymentClient,
                                  DomainEventPublisher eventPublisher,
                                  PlatformTransactionManager transactionManager) {
         this.orderMainRepository = orderMainRepository;
         this.stateMachine = stateMachine;
         this.inventoryClient = inventoryClient;
+        this.promotionClient = promotionClient;
         this.paymentClient = paymentClient;
         this.eventPublisher = eventPublisher;
         this.txTemplate = new TransactionTemplate(transactionManager);
@@ -152,6 +162,7 @@ public class OrderLifecycleService {
                 "用户取消" + (reason == null || reason.isBlank() ? "" : ": " + reason));
         fillCloseReason(parent, "manual");
         releaseQuietly(parent, "买家取消");
+        releaseCouponQuietly(parent, "买家取消");
         AfterCommitEvents.publish(eventPublisher, DomainEventNames.ORDER_CANCELLED, Map.of(
                 "orderId", parent.getId(), "orderNo", parent.getOrderNo(),
                 "userId", parent.getUserId(), "reason", "user-cancel"));
@@ -219,6 +230,7 @@ public class OrderLifecycleService {
                 stateMachine.transition(parent.getId(), OrderStatus.CANCELLED, Operator.admin(adminId), note);
                 fillCloseReason(parent, "manual");
                 releaseQuietly(parent, "后台关闭");
+                releaseCouponQuietly(parent, "后台关闭");
                 AfterCommitEvents.publish(eventPublisher, DomainEventNames.ORDER_CANCELLED, Map.of(
                         "orderId", parent.getId(), "orderNo", parent.getOrderNo(),
                         "userId", parent.getUserId(), "reason", "admin-close"));
@@ -266,6 +278,7 @@ public class OrderLifecycleService {
         }
         fillCloseReason(parent, "timeout");
         releaseQuietly(parent, "超时关单");
+        releaseCouponQuietly(parent, "超时关单");
         AfterCommitEvents.publish(eventPublisher, DomainEventNames.ORDER_CANCELLED, Map.of(
                 "orderId", parent.getId(), "orderNo", parent.getOrderNo(),
                 "userId", parent.getUserId(), "reason", "timeout"));
@@ -274,17 +287,35 @@ public class OrderLifecycleService {
 
     // ------------------------------------------------------------------ 内部工具
 
-    /** 关单后补偿：已关单收到成功回调 → 原路退款 + 发 order.refund.applied（竞态败方，4.2.4）。 */
-    private void triggerRefund(OrderMain order, String reason) {
+    /**
+     * 关单后补偿：已关单收到成功回调 → 原路退款（竞态败方，4.2.4）。
+     *
+     * <p><b>事件诚实性（不得回退）</b>：{@code order.refund.applied} 的语义是「退款已被支付域受理」，
+     * 只在 {@link PaymentClient#refund} 返回 {@code true} 时发布；失败（网络异常 / 远端拒绝）时
+     * <b>只打 ERROR 告警不发布事件</b>——此前无论退款是否发生都无条件发该事件，下游（财务对账、
+     * 用户通知）会据此认为钱已退，是资金链上的虚假信号。</p>
+     *
+     * @return 退款是否已被支付域受理
+     */
+    private boolean triggerRefund(OrderMain order, String reason) {
+        boolean accepted;
         try {
-            paymentClient.refund(order.getId(), order.getPayAmount(), reason);
+            accepted = paymentClient.refund(order.getId(), order.getPayAmount(), reason);
         } catch (Exception e) {
             // 退款通道异常：必须告警并由对账任务补偿（admin-backend 13.2.2），禁止手工改单
-            log.error("退款调用失败，需对账补偿: orderNo={} amount={}", order.getOrderNo(), order.getPayAmount(), e);
+            log.error("[退款告警] 退款调用异常，退款待对账补偿: orderNo={} amount={}", order.getOrderNo(),
+                    order.getPayAmount(), e);
+            return false;
+        }
+        if (!accepted) {
+            log.error("[退款告警] 退款未被支付域受理，退款待对账补偿（不发 order.refund.applied）: orderNo={} amount={} reason={}",
+                    order.getOrderNo(), order.getPayAmount(), reason);
+            return false;
         }
         AfterCommitEvents.publish(eventPublisher, DomainEventNames.ORDER_REFUND_APPLIED, Map.of(
                 "orderId", order.getId(), "orderNo", order.getOrderNo(),
                 "userId", order.getUserId(), "amount", order.getPayAmount(), "reason", reason));
+        return true;
     }
 
     /** 释放预占库存（inventory 侧幂等，重复释放不会白送库存）；失败不回滚关单，留给对账补偿。 */
@@ -293,6 +324,28 @@ public class OrderLifecycleService {
             inventoryClient.release(parent.getId());
         } catch (Exception e) {
             log.error("释放库存失败（订单已流转，需对账补偿）: scene={} orderNo={}", scene, parent.getOrderNo(), e);
+        }
+    }
+
+    /**
+     * 关单退券（used → available，promotion 侧幂等）：用户未付款被关单，券必须回到可用。
+     *
+     * <p>{@code couponId} 为空（本单未用券，或下单侧尚未落 coupon_id 的存量数据）→ 直接跳过；
+     * 调用失败<b>只告警不回滚关单</b>——券由对账兜底退给用户，绝不能因为退券失败而卡住订单流转。</p>
+     */
+    private void releaseCouponQuietly(OrderMain parent, String scene) {
+        Long couponId = parent.getCouponId();
+        if (couponId == null) {
+            return; // 本单未用券，无需退券
+        }
+        try {
+            if (!promotionClient.releaseCoupon(couponId, parent.getUserId(), parent.getId())) {
+                log.error("[退券告警] 退券未被受理，券待对账补偿（订单已流转）: scene={} orderNo={} couponId={}",
+                        scene, parent.getOrderNo(), couponId);
+            }
+        } catch (Exception e) {
+            log.error("[退券告警] 退券调用异常，券待对账补偿（订单已流转）: scene={} orderNo={} couponId={}",
+                    scene, parent.getOrderNo(), couponId, e);
         }
     }
 

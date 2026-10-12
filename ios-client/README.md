@@ -73,6 +73,10 @@ java -jar server/gateway/target/gateway-0.1.0-SNAPSHOT.jar
 
 - 响应信封 `{code,msg,data,traceId}`，HTTP 200 也可能业务失败 → **先解信封再看状态码**（APIClient 已实现）。
 - 分页 `{total,pageNum,pageSize,list}`；字段 camelCase；金额一律 `Decimal`（**禁止 Double**）。
+- **解码失败禁止 `try?` 静默**：`APIClient` 会把 DecodingError 的字段路径与响应体片段抛到 UI，
+  用于第一时间暴露"模型字段类型与后端相反"这类编译期发现不了的契约错（见七章）。
+- 后端下发的**枚举字符串不得当数字解**：订单状态是 0 基 8 值 `Int`（`OrderStatus` 单点定义），
+  券状态是英文串 `available/used/expired`（`CouponStatus` 单点定义）。
 - 订单状态 **0 基 8 值**：0待付款/1待发货/2待收货/3已完成/4退款中/5已退款/6已取消/7已关闭，
   唯一映射点 `Features/Order/OrderModels.swift` 的 `OrderStatus`。
 - 支付超时读订单 `payDeadline`（ISO8601），**不硬编码分钟数**（裁决 C7）。
@@ -135,7 +139,7 @@ ios-client/
 |--------|---------|------|
 | iOS BFF 首页聚合 `GET /api/v1/bff/ios/home` | 未实现 → 首页降级为「商品列表 + 热搜词」两接口 | `Home/` |
 | 订单预览 `POST /api/v1/orders/preview` | 未实现 → 结算金额客户端本地计算，提交以服务端计价为准 | `Checkout/` |
-| 促销/优惠券抵扣 | core-order P0 促销降级（试算不折扣）→ 券试算仅展示；仅 `eligible=true` 时提交携带 `couponId` | `Checkout/CheckoutViewModel` |
+| 促销/优惠券抵扣 | core-order P0 促销降级（试算不折扣）→ 券试算仅展示；**仅 `eligible=true` 时提交携带 `couponId`**；选了券但 `eligible=false`/试算失败时**必须弹确认**，用户明确同意才按原价下单（禁止静默丢券） | `Checkout/CheckoutViewModel` |
 | 物流查询 | 未实现 → 「查看物流」toast 提示 P1 接入 | `Order/` |
 | 真实支付渠道（支付宝/微信等） | core-payment mock → `POST /payment/mock/pay` 直接回调成功 | `Pay/` |
 | 短信验证码 | 固定 `123456` | `Auth/` |
@@ -144,7 +148,66 @@ ios-client/
 | 图片磁盘缓存/预取 | 用系统 `AsyncImage`，P1 再引入图片库 | `Core/UI/RemoteImage` |
 | Refresh Token 入 Keychain | P0 存 UserDefaults，P1 迁移 | `APIClient` / `AppState` |
 
-## 七、编译自查清单（Mac 首次编译前逐项确认）
+## 七、P0 契约修复记录（2026-10-12，前端审计 AUDIT/02-frontend.md P0-1~P0-4）
+
+> 背景：本项目在 Windows 开发，**无法编译**（无 Xcode/Swift 工具链），所以"模型字段类型与后端相反"
+> 这类错误**编译期不会暴露**，只会在运行时被 `JSONDecoder` 抛错、被 `APIClient` 的静默兜底吞掉，
+> 表现为 `APIError.decode("HTTP 200")`——**支付与优惠券两条链路 100% 不可用且全程无提示**。
+> 下表每一项都以 `server/` **实际源码**为准（不是 plans 规划稿）：**稳定 DTO 用「文件 + record 行」定位，
+> 仍在演进的 Service 用「文件 + 方法名」定位**（行号会漂，符号名不会），改动时可直接回溯。
+
+### 7.1 支付：`Features/Pay/PayModels.swift`
+
+| 字段 | 后端出处（真值） | 修复前（iOS） | 修复后（iOS） | 影响 |
+|------|------------------|---------------|---------------|------|
+| `paymentId` | `PrepayResponse.java:17` `Long paymentId`（雪花，序列左移 1bit → 偶数） | `Int64?` | `Int64?`（不变） | — |
+| `channel` | `PrepayResponse.java:17` `Integer channel`（`PaymentService#prepay` 校验 1~4） | `Int?` | `Int?`（不变） | — |
+| `amount` | `PrepayResponse.java:17` `BigDecimal amount`；`PaymentService#prepay` 服务端定额（裁决 C7） | `Decimal?` | `Decimal?`（不变） | — |
+| `payType` | `PrepayResponse.java:17` `String payType`；取值见 `PaymentService#payTypeOf` | `String?` | `String?`（不变） | — |
+| **`payParams`** | **`PrepayResponse.java:17-18` `Map<String,String> payParams`**；`PaymentService#payParamsOf` 的三个 switch 分支**全部** `Map.of(...)` 返回 ≥2 键，**永不为 null** | **`String?`** ❌ | **`[String: String]`（非可选）** ✅ | JSONDecoder 解对象进 `String?` 抛 typeMismatch → 整包失败 → 支付页 100% 报"数据解析失败（HTTP 200）" |
+| **`expireAt`** | **`PrepayResponse.java:18` `Long expireAt`**；`PaymentService#toPrepayResponse` 以 `.getEpochSecond()` 下发（**epoch 秒**，非 ISO 串） | **`String?`** ❌ | **`Int64?` + `expireAtDate: Date?`** ✅ | 即使修好 payParams，此字段仍会让整包二次解析失败 |
+
+其余支付模型同步补齐后端出处注释（`MockPayResponse.java:4`、`PaymentStatusResponse.java:10-11`）。
+
+### 7.2 优惠券：`Features/Checkout/CheckoutModels.swift`
+
+| 字段 | 后端出处（真值） | 修复前 | 修复后 | 影响 |
+|------|------------------|--------|--------|------|
+| **`CheckoutCoupon.status`** | **`CouponRecordResponse.java:11` `String status`**，值来自 `CouponRecord#statusText()`（`available`/`used`/`expired`/`unknown`）；实测断言见 `CouponIntegrationTest` 的 `.andExpect(jsonPath("$.data.status").value("available"))` | **`Int?`** ❌ | **`String?` + `CouponStatus` 单点映射** ✅ | JSONDecoder 解 `"available"` 进 `Int?` 抛 typeMismatch → `loadCoupons` catch → `coupons=[]` → 券区恒空 |
+| **`CouponPreviewRequest.amount`** | **`PreviewRequest.java:14-15` `List<@NotNull BigDecimal> amount`**；`CouponService#preview` 服务端求和后算门槛/面额（`amounts` 为空直接 400） | **`Decimal`（标量）** ❌ | **`[Decimal]`（数组）** ✅ | Jackson `MismatchedInputException` → 400 → 试算恒失败 → `submit()` 因 `usable=false` 静默丢券 |
+| `CouponPreviewRequest.couponId` | `PreviewRequest.java:14` `Long couponId`；`CouponService#preview` 的形参名就是 `recordId`，并由 `requireOwnedRecord()` 校验归属 → 是**用户券记录 ID**，**不是模板 ID** | `Int64` | `Int64`（不变，已核对正确） | — |
+| `CouponPreviewResponse` | `PreviewResponse.java:12-14`（`couponId/templateId/couponName/totalAmount/discount/finalAmount/**eligible**/reason`） | `Codable` | `Decodable`（字段名本就正确，仅收紧为只解码） | — |
+
+`CheckoutCoupon` 同时按 `CouponRecordResponse.java:11-13` 补齐注释：`couponId`=记录 ID / `templateId`=模板 ID /
+`expireAt`·`receivedAt`= `Instant` → ISO-8601 字符串。
+
+**集中映射（单点定义，禁止散落字符串比较）**：`enum CouponStatus: String { available, used, expired, unknown }`
++ `CouponCoupon.statusValue`（未识别串一律降级 `.unknown`，页面永不错字崩溃）。
+
+### 7.3 静默失败治理（P0-4）
+
+| 位置 | 修复前 | 修复后 |
+|------|--------|--------|
+| `APIClient.perform`（原 `:218`） | `guard let envelope = try? JSONDecoder().decode(...) else { throw APIError.decode("HTTP \(status)") }` —— `try?` 把 DecodingError 全部吃掉，只剩一个 HTTP 码 | `do/catch` + `describe(_:)`（输出**字段路径 + 期望类型**，如"字段类型不匹配（期望 Dictionary<String,String>）@data.payParams"）+ `snippet(_:)`（响应体前 240 字符）。**解码失败必须可读地上抛到 UI** |
+| `CheckoutViewModel.loadCoupons` | `catch { coupons = [] }` —— 静默，用户以为"没有券" | 写入 `couponLoadError`，结算页券入口红色提示 + 券弹窗内「重新加载优惠券」按钮 |
+| `CheckoutViewModel.previewCoupon` | `catch { preview = nil }` —— 静默 | 写入 `couponPreviewError` 并在券卡/金额明细展示；新增请求序号 `previewSeq` 丢弃过期响应（快速切券不再被"后发先到"覆盖） |
+| `CheckoutViewModel.submit` | `let couponId = (preview?.usable ?? false) ? selectedCouponId : nil` —— **静默按原价成交** | 选了券但 `eligible != true` → **阻断下单**，弹 `confirmationDialog`（"该券不可用 / 仍按原价支付 / 返回选择优惠券"），用户明确确认后才以 `couponId = nil` 建单；券卡与金额明细同时常驻橙色提示 |
+| `CheckoutViewModel.performSubmit` / `confirmSubmitWithoutCoupon` | — | 拆出独立的 `performSubmit(address:couponId:router:)`，确认路径不再被二次拦截 |
+
+> 仅 `APIClient.performRefresh` 保留 `try?`：它的契约就是"换不到新 Token 就返回 nil"，
+> 调用方据此 `clearTokens()` + 发 `.sessionExpired` 收敛到重新登录，不构成静默降级（已在代码注释留档）。
+
+### 7.4 P1/P2 同批项
+
+| 项 | 修复 |
+|----|------|
+| `OrderListView.swift:9` `@StateObject` 双重初始化 backing store（与 `OrderDetailView`/`CheckoutView`/`PayView` 不一致） | 改为 `@StateObject private var vm: OrderListViewModel`（不给默认值），单点初始化 |
+| `APIClient` 非 Sendable 单例 + 可变状态（`accessToken`/`refreshTask`/`storedRefreshToken`），并发 refresh 单飞有竞态（AUDIT P1-3） | 类型标 `@MainActor`：读 `refreshTask` 到写 `refreshTask` 之间无 await 挂起点，串行化由 actor 保证，**顺带修掉"多个并发 401 各发一次 refresh → refresh token 轮转 → 误踢登录"**。所有调用方本来就是 `@MainActor` 的 ViewModel，调用写法不变 |
+| Swift 版本约束留档 | `APIClient.swift` 顶部「并发标注（改动前必读）」+ `project.yml` 显式 `SWIFT_STRICT_CONCURRENCY: minimal`：**切 Swift 6 语言模式或 `complete` 会成片报错，那是预期迁移成本** |
+
+---
+
+## 八、编译自查清单（Mac 首次编译前逐项确认）
 
 已在 Windows 侧完成的结构化自查（**43 个 Swift 文件**）：
 
@@ -163,6 +226,23 @@ ios-client/
       ISO-8601 字符串，兼容毫秒/纳秒小数位）；
 - [x] 与真实服务联调核对过信封与关键响应结构（auth/profile/addresses 实测通过；幂等键缺失会返回 1001，已由 APIClient 自动携带）。
 
+**2026-10-12 P0 契约修复批次的增量自查**（同样在无编译器的 Windows 上完成）：
+
+- [x] 本轮改动的每一个模型字段都能指到 `server/**` 的具体源码行（见上节「P0 契约修复记录」），
+      没有一个是"看起来对就改"；
+- [x] 用脚本（剥离注释/字符串字面量后计括号）复扫全部 **43 个 Swift 文件**：括号配对 0 失败；
+- [x] 所有 `APIClient.shared` 调用点核对过隔离上下文——**所有同步调用（`hasRefreshToken` /
+      `setAccessToken` / `storedRefreshToken` / `clearTokens`）都在 `@MainActor` 的 `AppState` 内**，
+      其余全部是 `await` 的 async 调用点，标 `@MainActor` 不会引入同步跨隔离错误；
+- [x] 新增符号引用闭环：`CouponStatus` / `CouponFallbackNotice` / `displayName` / `statusValue` /
+      `reloadCoupons()` / `previewing` / `couponLoadError` / `couponPreviewError` /
+      `couponProblemNotice` / `hasCouponProblem` / `cancelSubmit()` /
+      `confirmSubmitWithoutCoupon(router:)` / `expireAtDate` 均已定义且有使用点；
+- [x] 本轮**未使用** Swift 5.7+ 的 `if let x` / `guard let x` 简写（统一显式 `= x`），
+      也未引入任何三方依赖（保持零 SPM 依赖）；新用到的 API 均为 iOS 15+ 且已在
+      deploymentTarget 16.0 之内：`.confirmationDialog(_:isPresented:titleVisibility:actions:message:)`、
+      `.overlay(alignment:)`、`Decimal`、`JSONDecoder`。
+
 Mac 上首次编译请额外注意：
 
 1. **先 `xcodegen generate`**（`.xcodeproj` 不入库，直接开会提示不存在）；
@@ -171,7 +251,7 @@ Mac 上首次编译请额外注意：
 3. iOS 16.0 模拟器运行（用到 `.presentationDetents`、`NavigationStack`、`TimelineView` 等 iOS 16 API）；
 4. 编译错误优先对照本 README「编译自查清单」与各文件头注释中的口径说明修复。
 
-## 八、测试与验收（联调手顺）
+## 九、测试与验收（联调手顺）
 
 1. 启动全部后端服务 + gateway（见「三、后端联调」）；
 2. 模拟器运行 App → 注册（手机号任意合法格式，验证码 `123456`）→ 登录；
@@ -181,3 +261,17 @@ Mac 上首次编译请额外注意：
 6. 订单列表切 Tab、下拉刷新、取消待付款订单、确认收货；
 7. 我的 → 地址管理：新增/编辑/设默认/删除（编辑时需重填手机号，列表出参已脱敏）；
 8. 杀进程重启 → 应通过 Refresh Token 恢复登录态；断网/服务停机 → 错误态与服务端 msg 直显。
+
+### P0 契约修复批次的验收重点（2026-10-12 新增）
+
+1. **支付**：下单 → 收银台 → 确认支付，必须走到"支付成功"。
+   若仍失败，toast/错误页文案现在是**可读定位信息**（形如
+   `数据解析失败（HTTP 200：字段类型不匹配（期望 Dictionary<String,String>）@data.payParams；响应片段 {...}）`），
+   **直接把这段文案贴回来定位**，不要再报"支付失败"了事。
+2. **优惠券**：结算页点券入口 → 应能看到券列表且每张带状态文案（可用/已使用/已过期）；
+   选一张满减券（订单金额达标）→ 金额明细「优惠」应立刻出现 `-面额`；
+   选一张不达门槛的券 → 券卡与金额明细出现橙色常驻提示，提交订单时弹「该券不可用」确认框。
+3. **静默失败验证**：停掉 `core-promotion`（:8088）后重进结算页 →
+   券入口应显示红色「加载失败」并提供「重新加载优惠券」，而不是"暂无可用"。
+4. **并发 401**：冷启动后同时触发多个请求并让 access token 过期 → 不应被误踢登录
+   （`APIClient` 已标 `@MainActor`，refresh 单飞由 actor 串行保证）。

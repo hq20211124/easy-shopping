@@ -22,11 +22,12 @@ import {
   Tag,
 } from 'antd';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ORDER_REMARK_AVAILABLE, addOrderRemark, closeOrder, getOrderDetail } from '@/api/order';
+import { AFTER_SALE_AVAILABLE, ORDER_REMARK_AVAILABLE, addOrderRemark, closeOrder, getOrderDetail } from '@/api/order';
 import { ORDER_STATUS_OPTIONS, PAY_TYPE_OPTIONS } from '@/config/constants';
 import { StatusTag } from '@/components/StatusTag';
 import { AuthButton } from '@/components/AuthButton';
 import { PageLoading } from '@/components/PageLoading';
+import QueryError from '@/components/QueryError';
 import { formatAmount, maskPhone } from '@/utils/format';
 
 export default function OrderDetail() {
@@ -36,7 +37,7 @@ export default function OrderDetail() {
   const [remarkOpen, setRemarkOpen] = useState(false);
   const [remarkText, setRemarkText] = useState('');
 
-  const { data: order, isLoading } = useQuery({
+  const { data: order, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['order', id],
     queryFn: () => getOrderDetail(Number(id)),
     enabled: Boolean(id),
@@ -65,6 +66,10 @@ export default function OrderDetail() {
     },
   });
 
+  // 加载失败必须显式报错：否则 isLoading 结束后 order 恒 null，页面永远停在骨架屏（静默失败）
+  if (isError) {
+    return <QueryError error={error} onRetry={() => void refetch()} title="订单详情加载失败" />;
+  }
   if (isLoading || !order) return <PageLoading />;
 
   // 状态步骤映射（admin-backend 4.3 状态机：0待付款→1待发货→2待收货→3已完成）
@@ -105,9 +110,19 @@ export default function OrderDetail() {
         style={{ marginBottom: 24, maxWidth: 760 }}
       />
 
-      {order.orderStatus === 4 && (
-        <Alert type="warning" showIcon style={{ marginBottom: 16 }} message="订单退款中，请前往「退款售后」处理退款单" />
-      )}
+      {order.orderStatus === 4 &&
+        (AFTER_SALE_AVAILABLE ? (
+          <Alert type="warning" showIcon style={{ marginBottom: 16 }} message="订单退款中，请前往「退款售后」处理退款单" />
+        ) : (
+          // 售后域后端未实现 → 入口已下线，不要给出点不动的指引（静默/死链指引）
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message="订单退款中"
+            description="退款单处理入口尚未开放（后端 /api/admin/after-sale/* 未实现，P1 补齐），请联系订单/售后系统处理。"
+          />
+        ))}
       {order.orderStatus === 6 && (
         <Alert type="info" showIcon style={{ marginBottom: 16 }} message="订单已取消（未支付即取消，无资金流）" />
       )}

@@ -29,6 +29,7 @@ import {
   type AdminUser,
 } from '@/api/user';
 import { AuthButton } from '@/components/AuthButton';
+import { QueryErrorText } from '@/components/QueryError';
 import { normalizePage } from '@/utils/query';
 
 interface UserFormValues {
@@ -49,7 +50,7 @@ export default function UserList() {
 
   const pageQuery = useMemo(() => ({ ...normalizePage(pageNum, pageSize), keyword }), [pageNum, pageSize, keyword]);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['admin-users', pageQuery],
     queryFn: () => listAdminUsers(pageQuery),
     placeholderData: (prev) => prev,
@@ -178,6 +179,8 @@ export default function UserList() {
         loading={isLoading}
         columns={columns}
         dataSource={data?.list}
+        // 「加载失败」≠「没有用户」：显式错误文案 + 重试入口
+        locale={{ emptyText: isError ? <QueryErrorText error={error} onRetry={() => void refetch()} /> : '暂无用户' }}
         scroll={{ x: 1000 }}
         pagination={{
           current: data?.pageNum ?? pageNum,

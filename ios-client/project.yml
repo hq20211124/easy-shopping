@@ -9,6 +9,10 @@ settings:
   base:
     # 语言模式 Swift 5（工具链可为 5.7+/6.x，仍按 Swift 5 模式编译）
     SWIFT_VERSION: "5.0"
+    # ⚠️ 显式声明"最小"并发检查：Swift 5 语言模式的默认值，写出来是为了让
+    # 「切 Swift 6 / 开 complete 会成片报错」成为一次有意识的迁移决策，而不是事故。
+    # 见 Core/Network/APIClient.swift 顶部的「并发标注（改动前必读）」。
+    SWIFT_STRICT_CONCURRENCY: minimal
     MARKETING_VERSION: 0.1.0
     CURRENT_PROJECT_VERSION: 1
     CODE_SIGN_STYLE: Automatic

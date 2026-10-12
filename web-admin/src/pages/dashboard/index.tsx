@@ -12,15 +12,26 @@ import { useQuery } from '@tanstack/react-query';
 import { getTodoList, getWorkbench } from '@/api/system';
 import { formatAmount, formatNumber } from '@/utils/format';
 import { PageLoading } from '@/components/PageLoading';
+import QueryError from '@/components/QueryError';
 
 export default function Dashboard() {
-  const { data: workbench, isLoading } = useQuery({
+  const {
+    data: workbench,
+    isLoading,
+    isError,
+    error,
+    refetch,
+  } = useQuery({
     queryKey: ['workbench'],
     queryFn: getWorkbench,
     staleTime: 5 * 60_000, // 看板数据 5 分钟内不重复请求（前端 3.1）
   });
   const { data: todo } = useQuery({ queryKey: ['todo'], queryFn: getTodoList });
 
+  // 加载失败必须显式报错：否则看板会渲染成一排 0，与「真实业务为 0」无法区分（静默失败）
+  if (isError) {
+    return <QueryError error={error} onRetry={() => void refetch()} title="工作台数据加载失败" />;
+  }
   if (isLoading && !workbench) return <PageLoading />;
 
   return (
@@ -90,6 +101,9 @@ export default function Dashboard() {
       <Card className="page-card" title="近 7 日趋势">
         <Typography.Paragraph type="secondary" style={{ marginBottom: 12 }}>
           数据来源：admin-data 预聚合表（17.4），T+1 离线口径；实时看板 P1 接入 WebSocket 推送。
+          {' '}
+          <br />
+          注：P0 后端 `AdminDataController` 为 stub（gmv/orderCount 恒 0、趋势与待办恒空），示例数据仅 mock 环境可见。
         </Typography.Paragraph>
         <List
           grid={{ gutter: 12, column: 7 }}

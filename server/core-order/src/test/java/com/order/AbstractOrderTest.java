@@ -34,6 +34,7 @@ import java.util.stream.Collectors;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.when;
 
 /**
@@ -82,6 +83,13 @@ abstract class AbstractOrderTest {
         Mockito.reset(productClient, priceClient, inventoryClient, promotionClient, paymentClient);
         // 默认：无券不折扣（promotion 就绪后由具体用例覆盖）
         when(promotionClient.deductCoupon(any(), any(), any(), any())).thenReturn(BigDecimal.ZERO);
+        // 默认：退券被 coupon 侧受理成功（promotion release 幂等）
+        when(promotionClient.releaseCoupon(any(), any(), any())).thenReturn(true);
+        // 默认：退款被支付域受理成功。
+        // P0-2 后 PaymentClient#refund 返回「是否受理」：mock 不打桩时默认 false，
+        // 会让 triggerRefund 拒绝发 order.refund.applied（这正是修复后的真实语义），
+        // 因此这里显式打桩为「受理成功」，拒绝路径由专门用例覆盖。
+        when(paymentClient.refund(any(), any(), anyString())).thenReturn(true);
     }
 
     /** 打桩商品目录（core-product / core-price）。 */

@@ -15,6 +15,8 @@ const checkout = useCheckoutStore()
 
 const data = ref<CartListResponse | null>(null)
 const loading = ref(false)
+/** 列表拉取失败：区分「购物车是空的」与「购物车拉不到」，避免加载失败时显示"空购物车"误导用户 */
+const failed = ref(false)
 
 const validItems = computed(() => data.value?.items.filter((i) => !i.invalid) || [])
 const invalidItems = computed(() => data.value?.items.filter((i) => i.invalid) || [])
@@ -26,16 +28,22 @@ const selectedAmount = computed(() =>
 
 async function load() {
   loading.value = true
+  failed.value = false
   try {
     data.value = await cartApi.list()
     cartStore.count = data.value.totalQuantity
+  } catch (e) {
+    // toast 已由请求层统一弹出，这里只置错误态（禁止静默吞错：页面要能看出"加载失败"）
+    void e
+    data.value = null
+    failed.value = true
   } finally {
     loading.value = false
   }
 }
 
 onShow(() => {
-  if (user.token) load()
+  if (user.token) void load()
 })
 
 async function toggleLine(item: CartItemVO) {
@@ -67,8 +75,20 @@ async function clearInvalid() {
   await load()
 }
 
-function goDetail(skuId: number) {
-  uni.navigateTo({ url: `/pages/product/detail?skuId=${skuId}` })
+/**
+ * 进商品详情页。
+ *
+ * 详情页只认 `spuId`（`GET /api/v1/products/{spuId}`），传 `skuId` 会让 `onLoad` 解析出 0 → 永不 load → 永久白屏。
+ * 购物车行下发的是 `productId`，后端 `CartService.add:106` 用 `sku.spuId()` 回填、`CartService.list:191-193`
+ * 每次列表自愈，即 `CartItemVO.productId` 就是 SPU 主键（core-cart CartDtos:73）。
+ */
+function goDetail(item: CartItemVO) {
+  // SKU 已被删除/清理时后端可能下发 productId=0，此时无处可跳，显式提示而不是进白屏页
+  if (!item.productId) {
+    uni.showToast({ title: '商品信息已失效，无法查看详情', icon: 'none' })
+    return
+  }
+  uni.navigateTo({ url: `/pages/product/detail?spuId=${item.productId}` })
 }
 
 function goLogin() {
@@ -109,6 +129,13 @@ function settle() {
       <ec-empty icon="🏠" text="请先登录后查看购物车" action-text="去登录" @action="goLogin" />
     </view>
     <ec-empty
+      v-else-if="failed"
+      icon="📡"
+      text="购物车加载失败，请检查网络后重试"
+      action-text="重新加载"
+      @action="load"
+    />
+    <ec-empty
       v-else-if="!loading && !validItems.length && !invalidItems.length"
       icon="🛒"
       text="购物车还是空的"
@@ -122,9 +149,9 @@ function settle() {
           <view class="cb" :class="{ on: l.selected }" @click="toggleLine(l)">
             <text v-if="l.selected">✓</text>
           </view>
-          <image class="cover" :src="l.mainImage" mode="aspectFill" @click="goDetail(l.skuId)" />
+          <image class="cover" :src="l.mainImage" mode="aspectFill" @click="goDetail(l)" />
           <view class="mid">
-            <view class="title" @click="goDetail(l.skuId)">{{ l.title }}</view>
+            <view class="title" @click="goDetail(l)">{{ l.title }}</view>
             <view class="tags" v-if="l.discountTags?.length">
               <text class="tag" v-for="(t, i) in l.discountTags" :key="i">{{ t }}</text>
             </view>

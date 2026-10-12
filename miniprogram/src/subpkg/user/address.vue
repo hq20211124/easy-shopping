@@ -9,19 +9,25 @@ import type { Address } from '@/api/types'
 const checkout = useCheckoutStore()
 const list = ref<Address[]>([])
 const selectMode = ref(false)
+/** 加载失败：显式错误态（原先失败后 list 恒空 → 显示"还没有收货地址"，与"接口挂了"无法区分） */
+const failed = ref(false)
 
 onLoad((options) => {
   selectMode.value = options?.select === '1'
 })
 
-onShow(() => load())
+onShow(() => void load())
 
 async function load() {
+  failed.value = false
   try {
     const res = await addressApi.list()
     list.value = res.addresses || []
   } catch (e) {
+    // toast 已由请求层统一弹出；显式置错误态，禁止静默显示"空地址列表"
     void e
+    list.value = []
+    failed.value = true
   }
 }
 
@@ -52,7 +58,15 @@ async function remove(a: Address) {
 
 <template>
   <view class="address">
-    <ec-empty v-if="!list.length" icon="📍" text="暂无收货地址" action-text="添加地址" @action="goEdit()" />
+    <ec-empty
+      v-if="failed"
+      icon="📡"
+      text="地址加载失败，请检查网络后重试"
+      action-text="重新加载"
+      @action="load"
+    />
+
+    <ec-empty v-else-if="!list.length" icon="📍" text="暂无收货地址" action-text="添加地址" @action="goEdit()" />
 
     <view class="card" v-for="a in list" :key="a.id" @click="choose(a)">
       <view class="row top">

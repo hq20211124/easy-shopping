@@ -120,7 +120,8 @@ class AuthControllerTest {
         register(mobile, "super-secret-9527");
 
         UserAccount user = userRepo.findByUsernameAndDeletedFalse(mobile).orElseThrow();
-        assertThat(user.getPasswordHash()).startsWith("s256$");
+        // P0-H：算法由单轮 SHA-256（s256$）升级为 PBKDF2-HMAC-SHA256（pbkdf2_sha256$迭代数$盐$哈希）
+        assertThat(user.getPasswordHash()).startsWith("pbkdf2_sha256$");
         assertThat(user.getPasswordHash()).doesNotContain("super-secret-9527");
         assertThat(PasswordHasher.matches("super-secret-9527", user.getPasswordHash())).isTrue();
         assertThat(PasswordHasher.matches("other", user.getPasswordHash())).isFalse();

@@ -38,6 +38,9 @@ import java.util.stream.Collectors;
  *
  * <p>买家端只可见父单（拆单后子单在详情/管理端展开）；状态 Tab 以服务端下发的
  * status/statusText/actions 为准（android-backend 4.3.4 落地约定 5），前端不自建状态文案表。</p>
+ *
+ * <p><b>隐私口径</b>：收货人手机号在所有出参统一脱敏（见 {@link #maskMobile}），
+ * 管理端列表/详情与买家端列表/详情一律不返回明文。</p>
  */
 @Service
 public class OrderQueryService {
@@ -109,7 +112,7 @@ public class OrderQueryService {
                 new AmountDetailView(parent.getTotalAmount(), parent.getFreightAmount(),
                         parent.getDiscountAmount(), parent.getPayAmount()),
                 itemViews, childViews,
-                parent.getReceiverName(), parent.getReceiverMobile(), parent.getReceiverAddress(),
+                parent.getReceiverName(), maskMobile(parent.getReceiverMobile()), parent.getReceiverAddress(),
                 parent.getRemark(), parent.getPayType(), parent.getPayTime(), parent.getPayDeadline(),
                 parent.getDeliveryTime(), parent.getReceiveTime(),
                 timeline, actionsOf(status), (long) parent.getVersion(), parent.getCreatedAt());
@@ -172,6 +175,33 @@ public class OrderQueryService {
 
     // ------------------------------------------------------------------ 组装
 
+    /**
+     * 收货人手机号脱敏：保留前 3 后 4（{@code 138****0000}）。
+     *
+     * <p><b>依据</b>：plans/ios-backend.md 1.2.1 DDL 注释明确
+     * 「user_address.mobile / order_main.receiver_mobile 等收货信息同为个人敏感信息，
+     * 接口输出统一按 12.5 规则脱敏」，12.6 隐私原则 2 要求「接口返回遵循最小化原则，
+     * 手机号、地址在列表类接口一律脱敏，明文仅在必要场景按需返回」；
+     * admin-backend 4.4.3 同样要求「敏感列（手机号、地址）脱敏后再写文件」。</p>
+     *
+     * <p><b>关于「订单 owner 本人查看自己订单是否可返回明文」</b>：plans 未对订单 owner 开明文例外
+     * （脱敏口径是按字段而非按调用方角色规定的），因此按保守口径<b>买家端详情同样脱敏</b>。
+     * 若产品确认「本人可见明文」，须先在 plans 12.5/12.6 增补该例外并配套
+     * 「仅本人 + 留痕」的专用接口，不能由本类自行开口子（否则管理端/导出链路会跟着漏出明文）。</p>
+     *
+     * <p>口径与 core-user 的 {@code MaskUtil.maskMobile} 一致；落库明文（P1 改 AES-256-GCM 密文存储 +
+     * 解密后按本规则脱敏），出参明文由 P1 的带权限专用接口提供。</p>
+     */
+    public static String maskMobile(String mobile) {
+        if (mobile == null || mobile.isBlank()) {
+            return mobile; // 订单表默认空串，保持原样返回（不转 null，避免前端渲染出 "null"）
+        }
+        if (mobile.length() < 7) {
+            return "****";
+        }
+        return mobile.substring(0, 3) + "****" + mobile.substring(mobile.length() - 4);
+    }
+
     private OrderListVO toBuyerListVO(OrderMain parent) {
         List<OrderMain> children = orderMainRepository.findByParentOrderNo(parent.getOrderNo());
         List<OrderMain> group = new ArrayList<>();
@@ -208,7 +238,7 @@ public class OrderQueryService {
                 order.getParentOrderNo(), order.getStoreId(),
                 status.getValue(), status.getText(), order.getPayType(), order.getPayTime(),
                 order.getTotalAmount(), order.getDiscountAmount(), order.getFreightAmount(), order.getPayAmount(),
-                order.getReceiverName(), order.getReceiverMobile(), order.getCloseReason(), order.getRemark(),
+                order.getReceiverName(), maskMobile(order.getReceiverMobile()), order.getCloseReason(), order.getRemark(),
                 order.isSplitFlag(), (long) order.getVersion(), itemViews,
                 children.stream()
                         .map(c -> toChildView(c, itemsByOrder.getOrDefault(c.getId(), List.of()).size()))

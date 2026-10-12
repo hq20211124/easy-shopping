@@ -89,9 +89,19 @@ public class OrderMain {
     @Column(name = "freight_amount", nullable = false, precision = 10, scale = 2)
     private BigDecimal freightAmount = BigDecimal.ZERO;
 
-    /** 应付金额 = 商品总额 - 优惠 + 运费。 */
+    /** 应付金额 = 商品总额 - 优惠 + 运费（支付域定额口径，见 {@code InternalOrderController}）。 */
     @Column(name = "pay_amount", nullable = false, precision = 12, scale = 2)
     private BigDecimal payAmount;
+
+    /**
+     * 本单核销的用户优惠券记录 ID（{@code coupon_record.id}，非券模板 ID）；未用券为 null。
+     *
+     * <p><b>关单退券的定位依据</b>：超时关单 / 买家取消 / 后台关闭三条路径据此调用
+     * {@code POST /api/v1/coupons/release} 把券退回 {@code available}（P0-3 修复）。
+     * 下单时由 {@code OrderCreateService} 写入；存量数据为 null 时退券被安全跳过（只告警不吞券静默失败）。</p>
+     */
+    @Column(name = "coupon_id")
+    private Long couponId;
 
     // ---- 收货地址快照（下单时固化，后续改地址不影响历史订单；P1 落库加密 + 输出脱敏）----
     @Column(name = "receiver_name", length = 64)
@@ -250,6 +260,14 @@ public class OrderMain {
 
     public void setPayAmount(BigDecimal payAmount) {
         this.payAmount = payAmount;
+    }
+
+    public Long getCouponId() {
+        return couponId;
+    }
+
+    public void setCouponId(Long couponId) {
+        this.couponId = couponId;
     }
 
     public String getReceiverName() {

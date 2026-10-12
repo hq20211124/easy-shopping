@@ -32,7 +32,11 @@ public class UserAccount {
     @Column(length = 20)
     private String mobile;
 
-    /** SHA-256+salt 哈希（s256$salt$hash）；绝不回传前端、绝不落日志 */
+    /**
+     * 密码哈希（{@code PasswordHasher} 生成，绝不回传前端、绝不落日志）。
+     * P0-H 起为 {@code pbkdf2_sha256$迭代数$盐$哈希}；存量 {@code s256$盐$哈希}（单轮 SHA-256）
+     * 仅用于兼容校验，登录成功后按 {@code PasswordHasher.rehashIfNeeded} 自动升级。
+     */
     @Column(name = "password_hash", nullable = false, length = 128)
     private String passwordHash;
 

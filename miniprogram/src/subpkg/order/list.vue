@@ -19,6 +19,8 @@ const active = ref('all')
 const orders = ref<OrderListVO[]>([])
 const loading = ref(false)
 const finished = ref(false)
+/** 列表拉取失败：区分「没有订单」与「订单拉不到」，避免加载失败时显示空列表误导用户 */
+const failed = ref(false)
 const page = ref(1)
 const pageSize = 10
 
@@ -36,23 +38,29 @@ async function load(reset = false) {
   }
   if (finished.value) return
   loading.value = true
+  failed.value = false
   try {
     const res = await orderApi.list({ status: active.value, page: page.value, pageSize })
     const records = res.list || []
     orders.value = reset ? records : [...orders.value, ...records]
     if (records.length < pageSize) finished.value = true
     else page.value += 1
+  } catch (e) {
+    // toast 已由请求层统一弹出，这里只置错误态（禁止静默吞错）
+    void e
+    if (reset) orders.value = []
+    failed.value = true
   } finally {
     loading.value = false
   }
 }
 
-onShow(() => load(true))
+onShow(() => void load(true))
 
 function switchTab(key: string) {
   if (active.value === key) return
   active.value = key
-  load(true)
+  void load(true)
 }
 
 function goDetail(orderId: number) {
@@ -105,7 +113,15 @@ function goHome() {
       </view>
     </scroll-view>
 
-    <ec-empty v-if="!loading && !orders.length" icon="📋" text="暂无订单" action-text="去逛逛" @action="goHome" />
+    <ec-empty
+      v-if="failed && !orders.length"
+      icon="📡"
+      text="订单加载失败，请检查网络后重试"
+      action-text="重新加载"
+      @action="load(true)"
+    />
+
+    <ec-empty v-else-if="!loading && !orders.length" icon="📋" text="暂无订单" action-text="去逛逛" @action="goHome" />
 
     <view class="card" v-for="o in orders" :key="o.orderId" @click="goDetail(o.orderId)">
       <view class="row hd">

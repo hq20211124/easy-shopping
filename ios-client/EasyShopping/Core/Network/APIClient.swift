@@ -90,7 +90,20 @@ enum APIError: LocalizedError {
 /// - Access Token **仅存内存**，Refresh Token 持久化（plans/ios-frontend 3.2）；
 /// - 收到 401 / 业务码 1002（未登录）/ 1003（Token 过期）→ 单飞刷新，**只重试一次**；
 /// - 写接口（非 GET）自动携带 `Idempotency-Key: UUID().uuidString`，401 重试复用同一个键；
-/// - 业务错误以 `msg` 透传给 UI（3002 库存不足、券失效等直显，禁止前端改写文案）。
+/// - 业务错误以 `msg` 透传给 UI（3002 库存不足、券失效等直显，禁止前端改写文案）；
+/// - **解码失败必须抛出可读错误并上抛到 UI**，禁止 `try?` 静默（见 `perform` 内的说明）。
+///
+/// ## 并发标注（改动前必读）
+/// - 本类型标了 `@MainActor`：单例 + 可变状态（accessToken / refreshTask / storedRefreshToken）
+///   在 `@MainActor` 下天然串行，既消除 `refreshPayload()` 里"判空与赋值之间无同步"的竞态
+///   （多个并发 401 各自发起 refresh → refresh token 轮转把用户误踢下线，见 AUDIT P1-3），
+///   也让状态访问有明确的隔离域。所有调用方都是 `@MainActor` 的 ViewModel，
+///   `await APIClient.shared.request(...)` 的写法无需改动。
+/// - ⚠️ **语言模式约束**：`project.yml` 设 `SWIFT_VERSION: "5.0"` 且**未开严格并发**
+///   （`SWIFT_STRICT_CONCURRENCY` 显式设 `minimal`）。切到 Swift 6 语言模式或
+///   `complete` 检查时，`URLSession` 之外的 `Data`/`NotificationCenter` 传参与
+///   各 View 的 `Task {}` 闭包会成片报错——那是**预期内**的迁移成本，不是回归。
+@MainActor
 final class APIClient {
 
     static let shared = APIClient()
@@ -215,8 +228,17 @@ final class APIClient {
             throw APIError.transport(error.localizedDescription)
         }
 
-        guard let envelope = try? JSONDecoder().decode(ApiResponse<T>.self, from: data) else {
-            throw APIError.decode("HTTP \(status)")
+        let envelope: ApiResponse<T>
+        do {
+            envelope = try JSONDecoder().decode(ApiResponse<T>.self, from: data)
+        } catch {
+            // P0-4 ①：禁止 `try?` 静默吞掉解码错误。
+            // 本项目最大的一类事故就是"模型字段类型与后端相反"（如 PrepayResponse.payParams
+            // 声明 String 后端下发 Map、CheckoutCoupon.status 声明 Int 后端下发英文串），
+            // JSONDecoder 直接抛 typeMismatch，被 try? 吞掉后只剩一句
+            // "数据解析失败（HTTP 200）"，支付页 100% 失败、券区恒空且用户零感知。
+            // 这里把 DecodingError 的字段路径 + 响应体片段一并抛出，联调时可直接定位到是哪个字段。
+            throw APIError.decode("HTTP \(status)：\(APIClient.describe(error))；响应片段 \(APIClient.snippet(data))")
         }
 
         if envelope.code == 0 {
@@ -227,6 +249,8 @@ final class APIClient {
         let message = envelope.msg ?? "请求失败"
 
         // 401 / 1002 未登录 / 1003 Token 过期 → 刷新一次后重试（只重试一次）
+        // 注意逗号是「条件列表」分隔符，实际语义是 `(retryOnAuth) && (status==401 || code==1002 || code==1003)`，
+        // 不是运算符优先级问题。
         if retryOnAuth, status == 401 || envelope.code == 1002 || envelope.code == 1003 {
             if let payload = await refreshPayload(), payload.accessToken != nil {
                 return try await perform(path, method: method, query: query,
@@ -241,8 +265,56 @@ final class APIClient {
         throw APIError.server(code: envelope.code, message: message)
     }
 
+    // MARK: 解码失败的可读化（把"契约错配"变成能定位的一句话）
+
+    /// 把 `DecodingError` 翻成"哪个字段、期望什么类型、实际是什么"的可读描述。
+    /// 这是本项目契约事故的主要抓手：类型不匹配时能直接点名字段，不再只报一个 HTTP 码。
+    private static func describe(_ error: Error) -> String {
+        guard let decodingError = error as? DecodingError else {
+            return "\(error)"
+        }
+        switch decodingError {
+        case .typeMismatch(let type, let context):
+            return "字段类型不匹配（期望 \(type)）@\(path(context))"
+        case .valueNotFound(let type, let context):
+            return "字段值为 null/缺失（期望 \(type)）@\(path(context))"
+        case .keyNotFound(let key, let context):
+            return "缺少字段 \(key.stringValue)@\(path(context))"
+        case .dataCorrupted(let context):
+            return "数据格式错误（\(context.debugDescription)）@\(path(context))"
+        @unknown default:
+            return "\(decodingError)"
+        }
+    }
+
+    private static func path(_ context: DecodingError.Context) -> String {
+        let joined = context.codingPath.map { $0.stringValue }.joined(separator: ".")
+        return joined.isEmpty ? "data" : "data." + joined
+    }
+
+    /// 响应体片段（截断），便于直接看出后端到底下发了什么
+    private static func snippet(_ data: Data, limit: Int = 240) -> String {
+        guard let text = String(data: data, encoding: .utf8) else {
+            return "<\(data.count) bytes 非 UTF-8>"
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "<空响应体>" }
+        return trimmed.count <= limit ? trimmed : String(trimmed.prefix(limit)) + "…"
+    }
+
     // MARK: 刷新（单飞）
 
+    /// 单飞刷新：并发 401 只发一次 refresh。
+    ///
+    /// 竞态说明（AUDIT P1-3）：旧版本这里是**非隔离**的普通类方法，
+    /// 「判 `refreshTask == nil`」与「赋值 `refreshTask = task`」之间没有同步点，
+    /// 冷启动并发 3 个请求同时 401 时会各发一次 refresh；后端
+    /// `AuthService.refresh` 会轮转 refresh token（P0 宽限 60s），
+    /// 第 2、3 次拿旧 token 被拒 → `refreshPayload()` 返回 nil → `clearTokens()` +
+    /// `.sessionExpired` → 用户刚登录就被踢回登录页。
+    ///
+    /// 现在整个类型标了 `@MainActor`，从读 `refreshTask` 到写 `refreshTask` 之间
+    /// **没有 await 挂起点**，串行化由 actor 保证，单飞不再依赖运气。
     private func refreshPayload() async -> TokenPayload? {
         if let task = refreshTask {
             return await task.value
@@ -270,6 +342,10 @@ final class APIClient {
     }
 
     /// 独立实现，避免在 @Sendable 闭包里捕获 self（并发检查更干净）。
+    ///
+    /// 这里的 `try?` 是**有意保留**的：本函数的契约就是「换不到新 Token 就返回 nil」，
+    /// 调用方 `perform` 会据此 `clearTokens()` + 发 `.sessionExpired` 收敛到重新登录，
+    /// 不构成"静默降级"。用户可见路径上的解码一律走 `perform` 里的 `do/catch`。
     private static func performRefresh(baseURL: String, refreshToken: String) async -> TokenPayload? {
         guard let url = URL(string: baseURL + "/api/v1/auth/refresh") else { return nil }
         var request = URLRequest(url: url)

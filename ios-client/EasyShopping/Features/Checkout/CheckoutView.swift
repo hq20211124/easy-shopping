@@ -45,6 +45,24 @@ struct CheckoutView: View {
             couponSheet
         }
         .toast($vm.message)
+        // P0-4 ③：选了券但券没生效时，阻断下单并要求用户明确确认（禁止静默按原价成交）
+        .confirmationDialog(
+            vm.pendingConfirm?.title ?? "",
+            isPresented: Binding(
+                get: { vm.pendingConfirm != nil },
+                set: { if !$0 { vm.cancelSubmit() } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(vm.pendingConfirm?.confirmTitle ?? "仍按原价支付") {
+                Task { await vm.confirmSubmitWithoutCoupon(router: router) }
+            }
+            Button(vm.pendingConfirm?.cancelTitle ?? "返回选择优惠券", role: .cancel) {
+                vm.cancelSubmit()
+            }
+        } message: {
+            Text(vm.pendingConfirm?.message ?? "")
+        }
     }
 
     // MARK: 地址
@@ -84,6 +102,16 @@ struct CheckoutView: View {
             .padding(12)
             .background(AppTheme.card)
             .cornerRadius(AppTheme.cornerRadius)
+            // P0-4：地址加载失败原因必须可见（VM 已写入 errorMessage，此前从未渲染）
+            .overlay(alignment: .bottomLeading) {
+                if let error = vm.errorMessage, !vm.isLoading {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundColor(.red)
+                        .padding(.leading, 12)
+                        .padding(.bottom, 2)
+                }
+            }
         }
         .buttonStyle(.plain)
     }
@@ -121,68 +149,139 @@ struct CheckoutView: View {
 
     // MARK: 优惠券
 
+    /// 券入口：加载失败 / 已选券未生效 / 试算失败都要**可见**，不能只剩"无可用"三个字
     private var couponCard: some View {
         Button {
             showCouponSheet = true
         } label: {
-            HStack {
-                Text("优惠券")
-                    .font(.subheadline)
-                Spacer()
-                if let preview = vm.preview, preview.usable,
-                   let discount = preview.discount, discount > 0 {
-                    Text("-\(Money.text(discount))")
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("优惠券")
                         .font(.subheadline)
-                        .foregroundColor(AppTheme.primary)
-                } else if !vm.coupons.isEmpty {
-                    Text("\(vm.coupons.count)张可用")
+                    Spacer()
+                    couponSummaryText
                         .font(.subheadline)
-                        .foregroundColor(.secondary)
-                } else {
-                    Text("无可用")
-                        .font(.subheadline)
+                        .foregroundColor(couponSummaryColor)
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
                         .foregroundColor(.secondary)
                 }
-                Image(systemName: "chevron.right")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                if let error = vm.couponLoadError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                } else if let error = vm.couponPreviewError, vm.selectedCouponId != nil {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                } else if let notice = vm.couponProblemNotice {
+                    Text(notice.message)
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                }
             }
             .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(AppTheme.card)
             .cornerRadius(AppTheme.cornerRadius)
         }
         .buttonStyle(.plain)
     }
 
+    @ViewBuilder
+    private var couponSummaryText: some View {
+        if vm.previewing {
+            Text("试算中…")
+                .foregroundColor(.secondary)
+        } else if let preview = vm.preview, preview.usable,
+                  let discount = preview.discount, discount > 0 {
+            Text("-\(Money.text(discount))")
+                .foregroundColor(AppTheme.primary)
+        } else if vm.couponLoadError != nil {
+            Text("加载失败")
+                .foregroundColor(.red)
+        } else if vm.hasCouponProblem {
+            Text("未生效")
+                .foregroundColor(.orange)
+        } else if !vm.coupons.isEmpty {
+            Text("\(vm.coupons.count)张可用")
+                .foregroundColor(.secondary)
+        } else {
+            Text("无可用")
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private var couponSummaryColor: Color {
+        if vm.couponLoadError != nil { return .red }
+        if vm.hasCouponProblem { return .orange }
+        return .secondary
+    }
+
     private var couponSheet: some View {
         NavigationStack {
             List {
-                Section {
-                    Button("不使用优惠券") {
-                        vm.selectCoupon(nil)
-                        showCouponSheet = false
+                if let error = vm.couponLoadError {
+                    // P0-4：券加载失败可见 + 可重试（不再静默显示"暂无可用"）
+                    Section {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(error)
+                                .font(.footnote)
+                                .foregroundColor(.red)
+                            Button("重新加载优惠券") {
+                                Task { await vm.reloadCoupons() }
+                            }
+                            .font(.footnote)
+                        }
                     }
-                    .foregroundColor(AppTheme.primary)
-
-                    ForEach(vm.coupons) { coupon in
-                        Button {
-                            vm.selectCoupon(coupon.couponId)
+                } else {
+                    Section {
+                        Button("不使用优惠券") {
+                            vm.selectCoupon(nil)
                             showCouponSheet = false
-                        } label: {
-                            HStack {
-                                Text(coupon.name ?? "优惠券")
-                                    .font(.subheadline)
-                                    .foregroundColor(.primary)
-                                Spacer()
-                                if vm.selectedCouponId == coupon.couponId {
-                                    Image(systemName: "checkmark")
-                                        .foregroundColor(AppTheme.primary)
+                        }
+                        .foregroundColor(AppTheme.primary)
+
+                        if vm.coupons.isEmpty {
+                            Text("暂无可用优惠券")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                        }
+
+                        ForEach(vm.coupons) { coupon in
+                            Button {
+                                vm.selectCoupon(coupon.couponId)
+                                showCouponSheet = false
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(coupon.displayName)
+                                            .font(.subheadline)
+                                            // 展示态统一走 CouponStatus 单点映射（后端下发英文串）
+                                            .foregroundColor(coupon.statusValue.isUsable ? .primary : .secondary)
+                                        Text(coupon.statusValue.text)
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    if vm.selectedCouponId == coupon.couponId {
+                                        Image(systemName: "checkmark")
+                                            .foregroundColor(AppTheme.primary)
+                                    }
                                 }
                             }
                         }
+                    } header: {
+                        Text("选择优惠券")
                     }
-                } header: {
-                    Text("选择优惠券")
+                }
+
+                if let notice = vm.couponProblemNotice {
+                    Section {
+                        Text(notice.message)
+                            .font(.footnote)
+                            .foregroundColor(.orange)
+                    }
                 }
             }
             .navigationTitle("优惠券")
@@ -216,10 +315,11 @@ struct CheckoutView: View {
         VStack(spacing: 8) {
             amountRow("商品合计", Money.text(vm.subtotal))
             amountRow("优惠", "-" + Money.text(vm.discount))
-            if let preview = vm.preview, !preview.usable, let reason = preview.reason {
-                Text(reason)
+            // 券未生效时给出**常驻**可见原因（服务端 reason / 试算异常 / 试算未完成都在文案里）
+            if let notice = vm.couponProblemNotice {
+                Text(notice.message)
                     .font(.caption)
-                    .foregroundColor(.secondary)
+                    .foregroundColor(.orange)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             amountRow("运费", "以服务端计价为准")

@@ -29,6 +29,7 @@ import { AUDIT_STATUS_OPTIONS } from '@/config/constants';
 import { StatusTag } from '@/components/StatusTag';
 import { AuthButton } from '@/components/AuthButton';
 import { PageLoading } from '@/components/PageLoading';
+import QueryError from '@/components/QueryError';
 import { usePermission } from '@/hooks/usePermission';
 import { formatAmount } from '@/utils/format';
 
@@ -42,7 +43,7 @@ export default function ProductDetail() {
   const { hasPermission } = usePermission();
   const [form] = Form.useForm<{ title: string; subtitle: string; price: number }>();
 
-  const { data: detail, isLoading } = useQuery({
+  const { data: detail, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['product', id],
     queryFn: () => getProductDetail(Number(id)),
     enabled: Boolean(id),
@@ -68,6 +69,10 @@ export default function ProductDetail() {
     },
   });
 
+  // 加载失败必须显式报错：否则 isLoading 结束后 detail 恒 null，页面永远停在骨架屏（静默失败）
+  if (isError) {
+    return <QueryError error={error} onRetry={() => void refetch()} title="商品详情加载失败" />;
+  }
   if (isLoading || !detail) return <PageLoading />;
 
   // 后端约束：仅 draft(0)/rejected(3) 可编辑（core-product ProductService.update）

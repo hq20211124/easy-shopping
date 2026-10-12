@@ -3,16 +3,38 @@
  *  - 售后单列表（状态 Tab：待审核/已同意/已拒绝/已完成）+ 同意/拒绝操作
  *  - 拒绝必须填写原因；退款原路返回，累计退款不超过订单实付（后端校验，5.6）
  *  - 退款完成后联动库存回补与积分/优惠券退回（后端 MQ 驱动）
- *  - ❌ 后端现状：/api/admin/after-sale/** 无对应 Controller（仅 mock 可用），详见 docs/api-contract-check.md
+ *  - ❌ 后端现状：`/api/admin/after-sale/**` **无对应 Controller**（server 全仓无 after-sale 控制器，
+ *    网关 `/api/admin/**` 兜底 admin-bff 后必 404），属 P1 缺口。
+ *    因此前端用 `AFTER_SALE_AVAILABLE` 特性开关**诚实下线**：真实后端下菜单入口隐藏 + 查询不发，
+ *    直接输 URL 也只显示"未开放"说明页，绝不出现"能点进去但永远空表"的空转。
  *  - 权限码：后端权限点注册表只有 refund:list（无 refund:approve/reject），按钮统一用 refund:list
  */
 import { useMemo, useState } from 'react';
-import { Card, Form, Input, message, Modal, Space, Table, Tabs, Typography, type TableColumnsType } from 'antd';
+import {
+  Card,
+  Form,
+  Input,
+  message,
+  Modal,
+  Result,
+  Space,
+  Table,
+  Tabs,
+  Typography,
+  type TableColumnsType,
+} from 'antd';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { approveAfterSale, listAfterSales, rejectAfterSale, type AfterSaleItem } from '@/api/order';
+import {
+  AFTER_SALE_AVAILABLE,
+  approveAfterSale,
+  listAfterSales,
+  rejectAfterSale,
+  type AfterSaleItem,
+} from '@/api/order';
 import { AFTER_SALE_STATUS_OPTIONS } from '@/config/constants';
 import { StatusTag } from '@/components/StatusTag';
 import { AuthButton } from '@/components/AuthButton';
+import { QueryErrorText } from '@/components/QueryError';
 import { formatAmount } from '@/utils/format';
 import { normalizePage } from '@/utils/query';
 
@@ -28,10 +50,11 @@ export default function OrderRefund() {
 
   const query = useMemo(() => ({ ...normalizePage(pageNum, pageSize), status: statusTab }), [pageNum, pageSize, statusTab]);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['after-sales', query],
     queryFn: () => listAfterSales({ ...query, status: statusTab === '' ? '' : Number(statusTab) }),
     placeholderData: (prev) => prev,
+    enabled: AFTER_SALE_AVAILABLE,
   });
 
   const invalidate = () => void queryClient.invalidateQueries({ queryKey: ['after-sales'] });
@@ -125,6 +148,19 @@ export default function OrderRefund() {
     [approveMutation],
   );
 
+  if (!AFTER_SALE_AVAILABLE) {
+    // 诚实下线：入口已隐藏，此处仅兜底"直接输 URL / 收藏夹"场景，明确告知原因，不发请求、不空转
+    return (
+      <Card className="page-card" title="退款售后">
+        <Result
+          status="info"
+          title="退款/售后功能未开放"
+          subTitle="后端 /api/admin/after-sale/* 尚未实现（P1 缺口，见 docs/api-contract-check.md），菜单入口已在真实后端模式下隐藏。"
+        />
+      </Card>
+    );
+  }
+
   return (
     <Card className="page-card" title="退款售后">
       <Tabs
@@ -146,6 +182,10 @@ export default function OrderRefund() {
         loading={isLoading}
         columns={columns}
         dataSource={data?.list}
+        // 请求失败 ≠ 没有数据：显式错误态 + 重试，避免"空表"被误读为无售后单
+        locale={{
+          emptyText: isError ? <QueryErrorText error={error} onRetry={() => void refetch()} /> : '暂无售后单',
+        }}
         scroll={{ x: 1150 }}
         pagination={{
           current: data?.pageNum ?? pageNum,

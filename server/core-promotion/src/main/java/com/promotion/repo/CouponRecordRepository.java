@@ -24,8 +24,11 @@ public interface CouponRecordRepository extends JpaRepository<CouponRecord, Long
     /**
      * 核销（防并发重复核销核心）：仅当 可用 + 未过期 才置 used 并绑定订单。
      * 返回 0 由调用方按当前状态细化（同订单幂等成功 / 他订单占用 / 已过期）。
+     *
+     * <p>{@code clearAutomatically}：批量 JPQL 更新绕过一级缓存，若不清理，随后
+     * {@code findById} 会命中旧实体，把「available」当成核销结果返回给调用方。</p>
      */
-    @Modifying
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
             UPDATE CouponRecord r
             SET r.status = :usedStatus, r.usedOrderId = :orderId, r.usedTime = :now
@@ -37,8 +40,11 @@ public interface CouponRecordRepository extends JpaRepository<CouponRecord, Long
                @Param("availableStatus") int availableStatus,
                @Param("usedStatus") int usedStatus);
 
-    /** 关单退回：used → available（清空订单绑定）。 */
-    @Modifying
+    /**
+     * 关单退回：used → available（清空订单绑定）。
+     * {@code clearAutomatically} 同 {@link #casUse}：退回后重读必须拿到新状态/新计数。
+     */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
             UPDATE CouponRecord r
             SET r.status = :availableStatus, r.usedOrderId = NULL, r.usedTime = NULL
@@ -58,4 +64,10 @@ public interface CouponRecordRepository extends JpaRepository<CouponRecord, Long
     int expireDue(@Param("now") Instant now,
                   @Param("availableStatus") int availableStatus,
                   @Param("expiredStatus") int expiredStatus);
+
+    /**
+     * 核销未确认候选（P0-G 兜底回收扫描）：status=used 且 核销时间（{@code used_time}，即 deducted_at）
+     * 早于阈值。是否真的回收还要回查订单（{@code DeductedOrderVerifier}）确认订单已不存在/已取消/已关闭。
+     */
+    List<CouponRecord> findByStatusAndUsedTimeLessThanEqual(int status, Instant threshold);
 }

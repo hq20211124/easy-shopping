@@ -48,7 +48,7 @@ import java.util.stream.Collectors;
  *
  * <p>流程：入参校验 → core-product 拿 SKU → core-price 权威计价 → core-inventory 预占（幂等键=父单雪花 ID）
  * → core-promotion 优惠券「试算 + 核销」（preview → deduct，任一步失败降级 discount=0，见 {@link RestPromotionClient}）
- * → 按 store_id 拆单（优惠按比例分摊 + 尾差归集首单）→ 写 order_main / order_item（雪花 ID + 24 位 order_no）
+ * → 按 store_id 拆单（优惠按比例分摊 + 尾差归集到金额最大的子单）→ 写 order_main / order_item（雪花 ID + 24 位 order_no）
  * → 设 pay_deadline → 事务提交后发 {@code order.created}。</p>
  *
  * <p><b>补偿</b>：预占成功后任何持久化失败都会调 {@code /release} 回补库存（P0 尽力而为；
@@ -184,6 +184,10 @@ public class OrderCreateService {
         parent.setDiscountAmount(discount);
         parent.setFreightAmount(BigDecimal.ZERO); // TODO(P1): 运费模板按店铺计算，未发货前为 0
         parent.setPayAmount(goodsTotal.subtract(discount));
+        // 核销成功的券记录 ID：关单/取消/超时关单时据此退券（AUDIT P0-3）。
+        // 只在真实产生优惠（discount>0，即扣券成功）时落库——扣券失败已降级为 discount=0，
+        // 此时写 couponId 会产生无谓的退券调用（AVAILABLE 券的 release 是幂等 no-op，但没必要）。
+        parent.setCouponId(discount.signum() > 0 ? request.couponId() : null);
         parent.setPayDeadline(payDeadline);
         parent.setReceiverName(nvl(request.receiverName()));
         parent.setReceiverMobile(nvl(request.receiverMobile()));
@@ -194,7 +198,7 @@ public class OrderCreateService {
         orderMainRepository.save(parent);
         orderStatusLogRepository.save(OrderStatusLog.created(idGenerator.nextId(), parent));
 
-        // 按 store_id 分组（store_id 必填：core-product 的 SKU 视图提供；分组键排序保证首单稳定）
+        // 按 store_id 分组（store_id 必填：core-product 的 SKU 视图提供；分组键排序保证子单顺序在多次重试间稳定）
         Map<Long, List<Long>> byStore = new LinkedHashMap<>();
         skuIdsSorted(quantities).forEach(skuId -> byStore
                 .computeIfAbsent(skuMap.get(skuId).storeId(), k -> new ArrayList<>())
@@ -204,7 +208,8 @@ public class OrderCreateService {
         List<BigDecimal> storeGoods = storeIds.stream()
                 .map(storeId -> storeGoodsAmount(byStore.get(storeId), quantities, priceMap))
                 .collect(Collectors.toList());
-        // 优惠按比例分摊到子单，尾差归集到首单（DiscountAllocator；Σ子单优惠 == 父单优惠）
+        // 优惠按比例分摊到子单，尾差归集到金额最大的子单（admin-backend 4.4.2「尾差归入金额最大的子单」；
+        // 分摊基数越大，同样 1 分钱尾差的相对误差越小 → 归到首单会让金额极小的店铺结算偏差被放大）
         List<BigDecimal> storeShares = DiscountAllocator.allocate(storeGoods, discount);
 
         List<SubOrderView> subOrders = new ArrayList<>();
@@ -229,7 +234,7 @@ public class OrderCreateService {
             orderMainRepository.save(child);
             orderStatusLogRepository.save(OrderStatusLog.created(idGenerator.nextId(), child));
 
-            // 行级优惠分摊（Σ行 == 子单优惠，尾差归集首行）
+            // 行级优惠分摊（Σ行 == 子单优惠，尾差同样归到金额最大的行）
             List<BigDecimal> lineBases = storeSkuIds.stream()
                     .map(skuId -> priceMap.get(skuId).multiply(BigDecimal.valueOf(quantities.get(skuId))))
                     .collect(Collectors.toList());

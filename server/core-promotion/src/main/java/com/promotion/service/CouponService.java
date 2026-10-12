@@ -7,15 +7,20 @@ import com.promotion.domain.CouponRecord;
 import com.promotion.domain.CouponTemplate;
 import com.promotion.repo.CouponRecordRepository;
 import com.promotion.repo.CouponTemplateRepository;
+import com.promotion.support.DeductedOrderVerifier;
 import com.promotion.web.dto.CouponRecordResponse;
 import com.promotion.web.dto.CouponTemplateRequest;
 import com.promotion.web.dto.CouponTemplateResponse;
 import com.promotion.web.dto.PreviewResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 
@@ -25,20 +30,36 @@ import java.util.List;
  * <p>并发控制口径：所有会改变"券资源"的写操作均为<b>条件更新（SQL CAS）</b>——
  * 领取 {@code received < limit} 才自增、核销 {@code status=0→1} 才绑定订单，
  * 多实例部署下同样安全（不依赖进程内锁/@Version 重试）。</p>
+ *
+ * <p><b>鉴权口径（P0-F）</b>：买家端 {@code deduct/release} 必须携带券主身份（{@code X-User-Id}），
+ * 缺身份或非券主一律 1004；服务端间调用走 {@code /api/v1/internal/coupons/{id}/*}
+ * （共享密钥 + 内网），对应 {@link #deductInternal}/{@link #releaseInternal}。
+ * 两套鉴权在 HTTP 层分离，服务层用不同方法名区分，避免任一入口漏校验。</p>
+ *
+ * <p><b>跨服务兜底（P0-G）</b>：核销与订单落库是两步，订单最终失败/关单而 core-order 未退券时，
+ * {@link #reclaimUnconfirmedDeducted()} 按「核销超时 + 回查订单确认不存在」把券退回 available。</p>
  */
 @Service
 public class CouponService {
 
+    private static final Logger log = LoggerFactory.getLogger(CouponService.class);
+
     private final CouponTemplateRepository templateRepo;
     private final CouponRecordRepository recordRepo;
     private final SnowflakeIdGenerator idGenerator;
+    private final DeductedOrderVerifier orderVerifier;
+    private final long deductTimeoutMinutes;
 
     public CouponService(CouponTemplateRepository templateRepo,
                          CouponRecordRepository recordRepo,
-                         SnowflakeIdGenerator idGenerator) {
+                         SnowflakeIdGenerator idGenerator,
+                         DeductedOrderVerifier orderVerifier,
+                         @Value("${app.promotion.deduct-timeout-minutes:60}") long deductTimeoutMinutes) {
         this.templateRepo = templateRepo;
         this.recordRepo = recordRepo;
         this.idGenerator = idGenerator;
+        this.orderVerifier = orderVerifier;
+        this.deductTimeoutMinutes = deductTimeoutMinutes;
     }
 
     // ---------- 用户侧 ----------
@@ -111,14 +132,51 @@ public class CouponService {
 
     /**
      * 核销（available → used + 绑定 orderId；条件更新防并发重复核销）。
+     *
+     * <p><b>归属校验强制（P0-F 修复）</b>：{@code userId} 必须非空且为券主本人，
+     * 缺失身份或他人券一律 {@link BizErrorCode#NO_PERMISSION}（1004/403），
+     * 不再存在「无 X-User-Id 即跳过校验」的水平越权口子。服务端间调用请走
+     * {@code POST /api/v1/internal/coupons/{id}/deduct}（共享密钥 + 内网）
+     * → {@link #deductInternal(Long, Long)}。</p>
+     *
      * <p>幂等语义：同一订单重复核销返回成功（订单重试安全）；他订单占用/已过期 → 拒绝。</p>
      */
     @Transactional
     public CouponRecordResponse deduct(Long recordId, Long orderId, Long userId) {
-        CouponRecord record = requireRecord(recordId);
-        if (userId != null && !record.getUserId().equals(userId)) {
-            throw new BizException(BizErrorCode.NO_PERMISSION, "无权操作他人优惠券");
-        }
+        return doDeduct(recordId, orderId, requireOwnedRecordStrict(recordId, userId));
+    }
+
+    /**
+     * 关单退回（used → available；幂等：已是可用直接成功）。
+     *
+     * <p>归属校验同 {@link #deduct}（P0-F）：必须携带券主身份。</p>
+     */
+    @Transactional
+    public CouponRecordResponse release(Long recordId, Long orderId, Long userId) {
+        return doRelease(recordId, orderId, requireOwnedRecordStrict(recordId, userId));
+    }
+
+    /**
+     * internal 端点专用核销（core-order 下单/关单链路，{@code X-Internal-Token} + 内网可达）。
+     *
+     * <p><b>不校验券归属</b>——调用方是服务端而非买家，鉴权在 {@code InternalCouponController}
+     * 的共享密钥上；买家端路径绝不调用本方法（否则等于把 P0-F 的越权口子留着）。
+     * P1 换 mTLS 后删除共享密钥即可。</p>
+     */
+    @Transactional
+    public CouponRecordResponse deductInternal(Long recordId, Long orderId) {
+        return doDeduct(recordId, orderId, null);
+    }
+
+    /** internal 端点专用退券（关单/支付失败补偿），鉴权同上。 */
+    @Transactional
+    public CouponRecordResponse releaseInternal(Long recordId, Long orderId) {
+        return doRelease(recordId, orderId, null);
+    }
+
+    /** 核销主体：{@code owner} 非空时已校验归属（买家端），为空表示 internal 信任调用。 */
+    private CouponRecordResponse doDeduct(Long recordId, Long orderId, CouponRecord owner) {
+        CouponRecord record = owner != null ? owner : requireRecord(recordId);
         Instant now = Instant.now();
         int updated = recordRepo.casUse(recordId, orderId, now,
                 CouponRecord.STATUS_AVAILABLE, CouponRecord.STATUS_USED);
@@ -137,13 +195,9 @@ public class CouponService {
         return toRecordResponse(updated2, requireTemplate(updated2.getCouponId()));
     }
 
-    /** 关单退回（used → available；幂等：已是可用直接成功）。 */
-    @Transactional
-    public CouponRecordResponse release(Long recordId, Long orderId, Long userId) {
-        CouponRecord record = requireRecord(recordId);
-        if (userId != null && !record.getUserId().equals(userId)) {
-            throw new BizException(BizErrorCode.NO_PERMISSION, "无权操作他人优惠券");
-        }
+    /** 退券主体：{@code owner} 语义同 {@link #doDeduct}。 */
+    private CouponRecordResponse doRelease(Long recordId, Long orderId, CouponRecord owner) {
+        CouponRecord record = owner != null ? owner : requireRecord(recordId);
         if (record.getStatus() == CouponRecord.STATUS_AVAILABLE) {
             return toRecordResponse(record, requireTemplate(record.getCouponId())); // 幂等：未核销无需退回
         }
@@ -173,6 +227,67 @@ public class CouponService {
     @Transactional
     public int expireDue() {
         return recordRepo.expireDue(Instant.now(), CouponRecord.STATUS_AVAILABLE, CouponRecord.STATUS_EXPIRED);
+    }
+
+    // ---------- 核销兜底回收（P0-G） ----------
+
+    /**
+     * 核销未确认兜底回收（定时任务入口，配置超时 {@code app.promotion.deduct-timeout-minutes}）。
+     *
+     * @return 本次回收（available 回退）张数
+     */
+    public int reclaimUnconfirmedDeducted() {
+        return reclaimUnconfirmedDeducted(Instant.now(), Duration.ofMinutes(deductTimeoutMinutes), orderVerifier);
+    }
+
+    /**
+     * 核销未确认兜底回收：核销（{@code used_time} 即 deducted_at）超过 {@code timeout} 仍停留在 used、
+     * 且回查订单确认「订单不存在 / 已取消 / 已关闭」的券，自动回退为 available。
+     *
+     * <p><b>为什么必须回查订单</b>：券核销（下单）与订单落库/支付成功是跨服务两步。若只按超时一刀切回收，
+     * 会把<b>已支付订单真正消费掉的券</b>也退给用户（凭空造券）。因此判定条件是
+     * 「超时 + 订单确实没了」，{@link DeductedOrderVerifier.Outcome#UNKNOWN}（core-order 不可达等）
+     * 一律<b>不回收</b>——宁可不退（人工可查）也不误退（资损/薅羊毛）。</p>
+     *
+     * <p>幂等：回退走条件更新 {@code used → available}，并发/重复执行只有第一次生效，
+     * 模板 {@code usedCount} 也只在首次回退时 -1（{@code usedCount > 0} 保护）。</p>
+     *
+     * @param verifier 订单存活校验器（测试可注入 lambda；生产为 REST 实现）
+     */
+    @Transactional
+    public int reclaimUnconfirmedDeducted(Instant now, Duration timeout, DeductedOrderVerifier verifier) {
+        Instant threshold = now.minus(timeout);
+        List<CouponRecord> candidates = recordRepo.findByStatusAndUsedTimeLessThanEqual(
+                CouponRecord.STATUS_USED, threshold);
+        int reclaimed = 0;
+        for (CouponRecord record : candidates) {
+            if (record.getUsedOrderId() == null) {
+                continue; // 无订单绑定的异常数据，不动
+            }
+            DeductedOrderVerifier.Outcome outcome = verifyQuietly(verifier, record);
+            if (outcome != DeductedOrderVerifier.Outcome.ORDER_GONE) {
+                continue; // ALIVE（订单仍有效）/ UNKNOWN（查不到）→ 不动
+            }
+            int updated = recordRepo.casRelease(record.getId(),
+                    CouponRecord.STATUS_USED, CouponRecord.STATUS_AVAILABLE);
+            if (updated > 0) {
+                templateRepo.decreaseUsedCount(record.getCouponId(), now);
+                reclaimed++;
+                log.warn("[coupon-deduct-reclaim] 核销未确认回收：券退回可用 couponRecordId={} couponId={} orderId={} usedTime={}",
+                        record.getId(), record.getCouponId(), record.getUsedOrderId(), record.getUsedTime());
+            }
+        }
+        return reclaimed;
+    }
+
+    private DeductedOrderVerifier.Outcome verifyQuietly(DeductedOrderVerifier verifier, CouponRecord record) {
+        try {
+            return verifier.verify(record.getUsedOrderId());
+        } catch (RuntimeException e) {
+            log.warn("[coupon-deduct-reclaim] 订单存活校验异常，按 UNKNOWN 处理（不回收）: orderId={}",
+                    record.getUsedOrderId(), e);
+            return DeductedOrderVerifier.Outcome.UNKNOWN;
+        }
     }
 
     // ---------- 管理端 ----------
@@ -262,6 +377,17 @@ public class CouponService {
             throw new BizException(BizErrorCode.NO_PERMISSION, "无权操作他人优惠券");
         }
         return record;
+    }
+
+    /**
+     * 买家端写操作的归属校验：身份缺失 <b>直接拒绝</b>（P0-F：原实现 {@code userId != null && ...}
+     * 在无 X-User-Id 时整段跳过，任意调用方可核销/退回任意用户的券）。
+     */
+    private CouponRecord requireOwnedRecordStrict(Long recordId, Long userId) {
+        if (userId == null) {
+            throw new BizException(BizErrorCode.NO_PERMISSION, "缺少用户身份，无法操作优惠券");
+        }
+        return requireOwnedRecord(recordId, userId);
     }
 
     private CouponTemplate requireTemplate(Long templateId) {

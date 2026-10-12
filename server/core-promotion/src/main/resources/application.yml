@@ -26,6 +26,13 @@ app:
   promotion:
     # 过期券翻转 cron（每小时第 20 分）。测试内置为远期，避免自动触发干扰断言
     expire-cron: "0 20 * * * *"
+    # 核销未确认兜底回收（P0-G）：核销超过 N 分钟仍停留 used，且回查 core-order 确认订单不存在/已取消/已关闭时自动退券
+    deduct-reconcile-cron: "0 */10 * * * *"
+    deduct-timeout-minutes: 60
+  internal:
+    # 服务间共享密钥（P0-F）：/api/v1/internal/coupons/** 核销/退券鉴权用。
+    # 默认留空 = 拒绝所有 internal 调用（fail-closed）；生产用环境变量注入，调用方 core-order 配置需保持一致。
+    token: ${APP_INTERNAL_TOKEN:}
   jwt:
     secret: ${APP_JWT_SECRET:dev-only-secret-change-me-in-prod-0123456789abcdef}
     access-ttl-seconds: 7200

@@ -51,7 +51,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "spring.datasource.url=jdbc:h2:mem:core-promotion-test;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE;DB_CLOSE_DELAY=-1",
         "spring.jpa.hibernate.ddl-auto=create-drop",
         "spring.jpa.properties.hibernate.globally_quoted_identifiers=true",
-        "app.promotion.expire-cron=0 0 0 1 1 *" // 远期 cron：禁用自动触发，测试手动调 expireDue()
+        "app.promotion.expire-cron=0 0 0 1 1 *", // 远期 cron：禁用自动触发，测试手动调 expireDue()
+        "app.promotion.deduct-reconcile-cron=0 0 0 1 1 *" // 远期 cron：禁用自动触发，测试手动调回收
 })
 @AutoConfigureMockMvc
 class CouponIntegrationTest {
@@ -164,7 +165,7 @@ class CouponIntegrationTest {
         AtomicInteger conflict = new AtomicInteger();
         runConcurrently(threads, i -> {
             try {
-                couponService.deduct(recordId, 900L + i, null); // 不同订单并发核销同一张券
+                couponService.deduct(recordId, 900L + i, BUYER); // 不同订单并发核销同一张券
                 success.incrementAndGet();
             } catch (BizException e) {
                 assertEquals(BizErrorCode.ORDER_STATUS_ERROR.getCode(), e.getCode());
@@ -188,24 +189,40 @@ class CouponIntegrationTest {
         long recordId = couponService.receive(templateId, BUYER).couponId();
 
         // 同订单重复核销：幂等成功
-        couponService.deduct(recordId, 555L, null);
-        couponService.deduct(recordId, 555L, null);
+        couponService.deduct(recordId, 555L, BUYER);
+        couponService.deduct(recordId, 555L, BUYER);
         assertEquals(1, templateRepo.findById(templateId).orElseThrow().getUsedCount(), "重复核销不重复计数");
 
         // 他订单核销：拒绝
-        BizException conflict = assertThrows(BizException.class, () -> couponService.deduct(recordId, 556L, null));
+        BizException conflict = assertThrows(BizException.class, () -> couponService.deduct(recordId, 556L, BUYER));
         assertEquals(BizErrorCode.ORDER_STATUS_ERROR.getCode(), conflict.getCode());
 
         // 关单退回 + 重复退回幂等
-        couponService.release(recordId, 555L, null);
-        couponService.release(recordId, 555L, null);
+        couponService.release(recordId, 555L, BUYER);
+        couponService.release(recordId, 555L, BUYER);
         CouponRecord record = recordRepo.findById(recordId).orElseThrow();
         assertEquals(CouponRecord.STATUS_AVAILABLE, record.getStatus());
         assertEquals(0, templateRepo.findById(templateId).orElseThrow().getUsedCount());
 
         // 退回后可再次核销（换订单）
-        couponService.deduct(recordId, 557L, null);
+        couponService.deduct(recordId, 557L, BUYER);
         assertEquals(557L, recordRepo.findById(recordId).orElseThrow().getUsedOrderId());
+    }
+
+    /** P0-F：无身份头调用（服务端层等价场景）必须拒绝，不得静默跳过归属校验。 */
+    @Test
+    void deductAndReleaseRejectMissingIdentity() throws Exception {
+        long templateId = createTemplate("1", "20", "100", 10, 5);
+        long recordId = couponService.receive(templateId, BUYER).couponId();
+
+        BizException noUser = assertThrows(BizException.class, () -> couponService.deduct(recordId, 800L, null));
+        assertEquals(BizErrorCode.NO_PERMISSION.getCode(), noUser.getCode());
+
+        BizException noUserRelease = assertThrows(BizException.class, () -> couponService.release(recordId, 800L, null));
+        assertEquals(BizErrorCode.NO_PERMISSION.getCode(), noUserRelease.getCode());
+
+        // 券状态未被改变
+        assertEquals(CouponRecord.STATUS_AVAILABLE, recordRepo.findById(recordId).orElseThrow().getStatus());
     }
 
     @Test
@@ -258,7 +275,7 @@ class CouponIntegrationTest {
         assertEquals(CouponRecord.STATUS_EXPIRED, recordRepo.findById(recordId).orElseThrow().getStatus());
 
         // 过期券不可核销
-        BizException e = assertThrows(BizException.class, () -> couponService.deduct(recordId, 777L, null));
+        BizException e = assertThrows(BizException.class, () -> couponService.deduct(recordId, 777L, BUYER));
         assertEquals(BizErrorCode.ORDER_STATUS_ERROR.getCode(), e.getCode());
     }
 

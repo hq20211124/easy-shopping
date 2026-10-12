@@ -24,7 +24,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 /**
- * 下单拆单测试（测试要求②）：按 store_id 拆单、优惠按比例分摊、尾差归集首单、
+ * 下单拆单测试（测试要求②）：按 store_id 拆单、优惠按比例分摊、尾差归集到金额最大的子单、
  * Σ子单实付 == 父单实付（admin-backend 4.4.2 规则 5 金额校验）。
  */
 @SpringBootTest(properties = {
@@ -37,7 +37,7 @@ import static org.mockito.Mockito.verify;
 class OrderCreateSplitTest extends AbstractOrderTest {
 
     @Test
-    void 拆单_三店铺优惠比例分摊_尾差归集首单且总额平衡() {
+    void 拆单_三店铺优惠比例分摊_尾差归集金额最大子单且总额平衡() {
         // 目录：店10001 两个 SKU（各 100 元）、店20001 一个（100 元）、店30001 一个（101 元）
         stubCatalog(
                 Map.of(20001L, sku(20001L, 10001L, 10001L),
@@ -83,7 +83,8 @@ class OrderCreateSplitTest extends AbstractOrderTest {
         assertThat(children.get(2).getStoreId()).isEqualTo(30001L);
 
         // 比例分摊（2 位 HALF_UP）：200/401*100=49.88、100/401*100=24.94、101/401*100=25.19，
-        // Σ=100.01 → 尾差 -0.01 归集到首单（店10001）→ 49.87
+        // Σ=100.01 → 尾差 -0.01 归集到金额最大的子单（店10001，200 元）→ 49.87
+        // （修复前归集到「首单」：本例首单恰好就是最大单，故数值不变；口径差异见下方不均衡用例）
         assertThat(children.get(0).getDiscountAmount()).isEqualByComparingTo("49.87");
         assertThat(children.get(1).getDiscountAmount()).isEqualByComparingTo("24.94");
         assertThat(children.get(2).getDiscountAmount()).isEqualByComparingTo("25.19");
@@ -126,6 +127,48 @@ class OrderCreateSplitTest extends AbstractOrderTest {
 
         // ---- order.created 事件（事务提交后）----
         assertThat(events).hasSize(1);
+    }
+
+    @Test
+    void 拆单_分摊基数极不均衡_尾差归集到金额最大的子单而非首单() {
+        // 店铺 ID 升序（10001 < 20001 < 30001）与金额大小完全反向：
+        // 首单只有 0.01 元，中间那单 100 元是最大单（plans 4.4.2「尾差归入金额最大的子单」）
+        stubCatalog(
+                Map.of(20001L, sku(20001L, 10001L, 10001L),
+                        30001L, sku(30001L, 20001L, 20001L),
+                        40001L, sku(40001L, 30001L, 30001L)),
+                Map.of(20001L, new BigDecimal("0.01"),
+                        30001L, new BigDecimal("100.00"),
+                        40001L, new BigDecimal("0.01")));
+        org.mockito.Mockito.when(promotionClient.deductCoupon(org.mockito.ArgumentMatchers.any(),
+                        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                        org.mockito.ArgumentMatchers.any()))
+                .thenReturn(new BigDecimal("50.00"));
+
+        CreateOrderResponse response = createService.create(10086L, request(List.of(
+                new OrderItemRequest(20001L, 1),
+                new OrderItemRequest(30001L, 1),
+                new OrderItemRequest(40001L, 1)), 60002L));
+
+        OrderMain parent = orderMainRepository.findById(response.orderId()).orElseThrow();
+        List<OrderMain> children = orderMainRepository.findByParentOrderNo(parent.getOrderNo()).stream()
+                .sorted(Comparator.comparing(OrderMain::getStoreId))
+                .toList();
+        assertThat(children).hasSize(3);
+        assertThat(parent.getTotalAmount()).isEqualByComparingTo("100.02");
+        assertThat(parent.getDiscountAmount()).isEqualByComparingTo("50.00");
+        assertThat(parent.getPayAmount()).isEqualByComparingTo("50.02");
+
+        // 尾差 +0.01 必须落在店20001（100 元），不能落到店10001（0.01 元）
+        assertThat(children.get(0).getDiscountAmount()).isEqualByComparingTo("0.00");
+        assertThat(children.get(1).getDiscountAmount()).isEqualByComparingTo("50.00");
+        assertThat(children.get(2).getDiscountAmount()).isEqualByComparingTo("0.00");
+
+        // Σ子单优惠 == 父单优惠；Σ子单实付 == 父单实付（规则 5）
+        assertThat(children.stream().map(OrderMain::getDiscountAmount).reduce(BigDecimal.ZERO, BigDecimal::add))
+                .isEqualByComparingTo("50.00");
+        assertThat(children.stream().map(OrderMain::getPayAmount).reduce(BigDecimal.ZERO, BigDecimal::add))
+                .isEqualByComparingTo(parent.getPayAmount());
     }
 
     @Test

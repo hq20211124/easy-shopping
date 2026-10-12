@@ -16,6 +16,11 @@ const form = ref<AddressPayload>({
   isDefault: false,
 })
 const saving = ref(false)
+/**
+ * 编辑态回填失败：原值没拿到时表单是全空的，若还允许保存会用空值覆盖真实地址（静默数据损坏）。
+ * 因此显式置位后禁用保存并给出可返回的提示。
+ */
+const loadFailed = ref(false)
 
 onLoad(async (options) => {
   id.value = Number(options?.id || 0)
@@ -33,16 +38,28 @@ onLoad(async (options) => {
         detail: a.detail,
         isDefault: !!a.isDefault,
       }
+    } else {
+      loadFailed.value = true
     }
   } catch (e) {
+    // toast 已由请求层统一弹出；显式禁用保存，禁止用空表单覆盖原地址
     void e
+    loadFailed.value = true
   }
 })
 
 const PHONE_RE = /^1[3-9]\d{9}$/
 
+function goBack() {
+  uni.navigateBack()
+}
+
 async function save() {
   if (saving.value) return
+  if (loadFailed.value) {
+    uni.showToast({ title: '原地址未加载成功，请返回重试', icon: 'none' })
+    return
+  }
   const f = form.value
   if (!f.name.trim()) {
     uni.showToast({ title: '请输入收货人姓名', icon: 'none' })
@@ -72,48 +89,57 @@ async function save() {
 
 <template>
   <view class="edit">
-    <view class="card">
-      <view class="row field">
-        <text class="label">收货人</text>
-        <input class="input" v-model="form.name" placeholder="姓名" placeholder-class="ph" maxlength="20" />
+    <ec-empty
+      v-if="loadFailed"
+      icon="⚠️"
+      text="原地址加载失败，保存已禁用（避免用空表单覆盖）"
+      action-text="返回"
+      @action="goBack"
+    />
+    <template v-else>
+      <view class="card">
+        <view class="row field">
+          <text class="label">收货人</text>
+          <input class="input" v-model="form.name" placeholder="姓名" placeholder-class="ph" maxlength="20" />
+        </view>
+        <view class="row field">
+          <text class="label">手机号</text>
+          <input
+            class="input"
+            v-model="form.mobile"
+            type="number"
+            placeholder="11 位手机号"
+            placeholder-class="ph"
+            maxlength="11"
+          />
+        </view>
+        <view class="row field">
+          <text class="label">省</text>
+          <input class="input" v-model="form.province" placeholder="省份" placeholder-class="ph" maxlength="20" />
+        </view>
+        <view class="row field">
+          <text class="label">市</text>
+          <input class="input" v-model="form.city" placeholder="城市" placeholder-class="ph" maxlength="20" />
+        </view>
+        <view class="row field">
+          <text class="label">区</text>
+          <input class="input" v-model="form.district" placeholder="区/县（选填）" placeholder-class="ph" maxlength="20" />
+        </view>
+        <view class="row field">
+          <text class="label">详细地址</text>
+          <input class="input" v-model="form.detail" placeholder="街道门牌等" placeholder-class="ph" maxlength="100" />
+        </view>
       </view>
-      <view class="row field">
-        <text class="label">手机号</text>
-        <input
-          class="input"
-          v-model="form.mobile"
-          type="number"
-          placeholder="11 位手机号"
-          placeholder-class="ph"
-          maxlength="11"
-        />
-      </view>
-      <view class="row field">
-        <text class="label">省</text>
-        <input class="input" v-model="form.province" placeholder="省份" placeholder-class="ph" maxlength="20" />
-      </view>
-      <view class="row field">
-        <text class="label">市</text>
-        <input class="input" v-model="form.city" placeholder="城市" placeholder-class="ph" maxlength="20" />
-      </view>
-      <view class="row field">
-        <text class="label">区</text>
-        <input class="input" v-model="form.district" placeholder="区/县（选填）" placeholder-class="ph" maxlength="20" />
-      </view>
-      <view class="row field">
-        <text class="label">详细地址</text>
-        <input class="input" v-model="form.detail" placeholder="街道门牌等" placeholder-class="ph" maxlength="100" />
-      </view>
-    </view>
 
-    <view class="card">
-      <view class="row field">
-        <text class="label">设为默认地址</text>
-        <switch :checked="form.isDefault" color="#e4393c" @change="(e: any) => (form.isDefault = e.detail.value)" />
+      <view class="card">
+        <view class="row field">
+          <text class="label">设为默认地址</text>
+          <switch :checked="form.isDefault" color="#e4393c" @change="(e: any) => (form.isDefault = e.detail.value)" />
+        </view>
       </view>
-    </view>
 
-    <view class="btn" :class="{ dis: saving }" @click="save">{{ saving ? '保存中...' : '保存' }}</view>
+      <view class="btn" :class="{ dis: saving }" @click="save">{{ saving ? '保存中...' : '保存' }}</view>
+    </template>
   </view>
 </template>
 

@@ -2,15 +2,14 @@
  * API 公共类型
  *
  * 契约出处：**server 实际实现** server/common/api/ApiResponse.java（`{code, msg, data, traceId}`）
- * + plans/admin-backend.md 2.5.2「接口通用规范」（plans 写作 message，实现为 msg，本文件两者兼容）
+ * + plans/admin-backend.md 2.5.2「接口通用规范」（plans 写作 message，实现为 msg，**以实现为准**）
  *  - 分页参数统一 pageNum / pageSize（前端边界 pageSize ≤ 100，见 admin-frontend 1.6 / 16.4）
  *  - 分页返回 PageResult{total, pageNum, pageSize, list}（server/common/api/PageResult.java）
  */
 
-/** 后端统一响应结构（server/common ApiResponse：字段名为 msg；message 为 plans 写法兼容别名） */
+/** 后端统一响应结构（server/common ApiResponse：字段名只有 msg，不存在 message） */
 export interface ApiResponse<T = unknown> {
   code: number;
-  message?: string;
   msg?: string;
   data: T;
   traceId?: string;

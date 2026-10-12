@@ -42,7 +42,9 @@ import java.util.Map;
  *   <li>可用库存不足同样返回 3002（TOCTOU 竞态由「同事务内校验+改写+乐观锁」闭合，见库存并发测试）；</li>
  *   <li>release / deduct 以 {@code orderId} 为业务幂等键：预占单状态机 ACTIVE→RELEASED/DEDUCTED
  *       单向流转（{@code @Version} 保证并发只成功一次），重复调用只生效一次——
- *       释放比扣减更危险，重复释放等于白送库存（4.4.4 第 4 条）。</li>
+ *       释放比扣减更危险，重复释放等于白送库存（4.4.4 第 4 条）；</li>
+ *   <li><b>release / deduct 为逐条独立短事务</b>（P0-E 幽灵锁修复）：每条预占单自成一个事务，
+ *       单条失败只记 ERROR 告警并继续，不会把已成功的条目整体回滚；</li>
  * </ul>
  *
  * <p>预占有效期 = 订单 {@code pay_deadline}；到期由 {@code InventoryExpireScheduler} 每 30s 扫描释放
@@ -143,27 +145,54 @@ public class InventoryService {
     /**
      * 释放预占（订单取消/超时关单）：locked → available，预占单 ACTIVE→RELEASED。
      *
-     * <p>幂等：已释放/已出库的订单重复调用返回 changed=0，不重复回补库存。</p>
+     * <p><b>逐条独立短事务（P0-E 幽灵锁修复）</b>：每条预占单自成一个事务，单条失败（sku_stock 记录缺失、
+     * 乐观锁耗尽、账本被并发扣减到不足…）只记录该条 ERROR 告警并继续处理下一条，
+     * <b>绝不因为第 N 条失败把前 N-1 条已完成的释放整体回滚</b>——那会让订单已关单但库存永久卡在 locked
+     * （plans/admin-backend.md 4.4.4 点名的「库存被幽灵锁死」v1.0 硬伤）。失败条目保持 ACTIVE，
+     * 由本方法重试、{@code InventoryExpireScheduler} 超时扫描或人工对账兜底。</p>
+     *
+     * <p>幂等：事务内重读预占单并二次校验 status=ACTIVE，已释放/已出库的条目直接跳过，
+     * 重复 release 不会把 locked 打成负数也不会白送库存。</p>
+     *
+     * @return 本次实际释放成功的条目数（失败条目不计入）
      */
     public OperationResult release(Long orderId) {
-        int changed = withOptimisticRetry("release", orderId, () -> {
-            List<StockReservation> actives =
-                    reservationRepository.findByOrderIdAndStatus(orderId, ReservationStatus.ACTIVE);
-            for (StockReservation reservation : actives) {
-                Stock stock = stockRepository.findBySkuId(reservation.getSkuId())
-                        .orElseThrow(() -> new BizException(BizErrorCode.SYSTEM_ERROR,
-                                "库存记录丢失，需人工核对: skuId=" + reservation.getSkuId()));
-                stock.release(reservation.getQuantity());
-                stockRepository.saveAndFlush(stock);
-                reservation.moveTo(ReservationStatus.RELEASED);
-                reservationRepository.saveAndFlush(reservation); // @Version 防与扣减/扫描并发双写
-                AfterCommitEvents.publish(eventPublisher, DomainEventNames.INVENTORY_CHANGE,
-                        inventoryChange(reservation.getSkuId(), reservation.getQuantity(), stock,
-                                "release", orderId));
+        List<StockReservation> actives =
+                reservationRepository.findByOrderIdAndStatus(orderId, ReservationStatus.ACTIVE);
+        int changed = 0;
+        for (StockReservation reservation : actives) {
+            try {
+                if (releaseOne(orderId, reservation.getId())) {
+                    changed++;
+                }
+            } catch (RuntimeException e) {
+                log.error("[inventory-release-failed] 预占释放失败，该条保持 ACTIVE 待重试/对账: "
+                                + "orderId={} reservationId={} skuId={} quantity={}",
+                        orderId, reservation.getId(), reservation.getSkuId(), reservation.getQuantity(), e);
             }
-            return actives.size();
-        });
+        }
         return new OperationResult(orderId, changed);
+    }
+
+    /** 单条预占释放（独立事务 + 乐观锁重试）；返回是否真的发生了释放。 */
+    private boolean releaseOne(Long orderId, Long reservationId) {
+        return withOptimisticRetry("release", orderId, () -> {
+            StockReservation fresh = reservationRepository.findById(reservationId).orElse(null);
+            if (fresh == null || fresh.getStatus() != ReservationStatus.ACTIVE) {
+                return false; // 已被扣减/超时释放/其他并发请求处理 → 幂等跳过
+            }
+            Stock stock = stockRepository.findBySkuId(fresh.getSkuId())
+                    .orElseThrow(() -> new BizException(BizErrorCode.SYSTEM_ERROR,
+                            "库存记录丢失，需人工核对: skuId=" + fresh.getSkuId()));
+            requireLockedEnough(stock, fresh, "release");
+            stock.release(fresh.getQuantity());
+            stockRepository.saveAndFlush(stock);
+            fresh.moveTo(ReservationStatus.RELEASED);
+            reservationRepository.saveAndFlush(fresh); // @Version 防与扣减/扫描并发双写
+            AfterCommitEvents.publish(eventPublisher, DomainEventNames.INVENTORY_CHANGE,
+                    inventoryChange(fresh.getSkuId(), fresh.getQuantity(), stock, "release", orderId));
+            return true;
+        });
     }
 
     // ------------------------------------------------------------------ 扣减
@@ -171,27 +200,48 @@ public class InventoryService {
     /**
      * 扣减（确认收货出库）：locked 减少（货权转移，不回补 available），预占单 ACTIVE→DEDUCTED。
      *
-     * <p>幂等：未预占/已出库/已释放的订单重复调用返回 changed=0。</p>
+     * <p>与 {@link #release} 同样的逐条独立短事务语义（P0-E）：单条失败不影响其它条目，
+     * 失败条目保持 ACTIVE 待重试/对账。</p>
+     *
+     * <p>幂等：事务内重读并校验 status=ACTIVE，未预占/已出库/已释放的订单重复调用返回 changed=0。</p>
      */
     public OperationResult deduct(Long orderId) {
-        int changed = withOptimisticRetry("deduct", orderId, () -> {
-            List<StockReservation> actives =
-                    reservationRepository.findByOrderIdAndStatus(orderId, ReservationStatus.ACTIVE);
-            for (StockReservation reservation : actives) {
-                Stock stock = stockRepository.findBySkuId(reservation.getSkuId())
-                        .orElseThrow(() -> new BizException(BizErrorCode.SYSTEM_ERROR,
-                                "库存记录丢失，需人工核对: skuId=" + reservation.getSkuId()));
-                stock.deduct(reservation.getQuantity());
-                stockRepository.saveAndFlush(stock);
-                reservation.moveTo(ReservationStatus.DEDUCTED);
-                reservationRepository.saveAndFlush(reservation);
-                AfterCommitEvents.publish(eventPublisher, DomainEventNames.INVENTORY_CHANGE,
-                        inventoryChange(reservation.getSkuId(), -reservation.getQuantity(), stock,
-                                "deduct", orderId));
+        List<StockReservation> actives =
+                reservationRepository.findByOrderIdAndStatus(orderId, ReservationStatus.ACTIVE);
+        int changed = 0;
+        for (StockReservation reservation : actives) {
+            try {
+                if (deductOne(orderId, reservation.getId())) {
+                    changed++;
+                }
+            } catch (RuntimeException e) {
+                log.error("[inventory-deduct-failed] 预占扣减失败，该条保持 ACTIVE 待重试/对账: "
+                                + "orderId={} reservationId={} skuId={} quantity={}",
+                        orderId, reservation.getId(), reservation.getSkuId(), reservation.getQuantity(), e);
             }
-            return actives.size();
-        });
+        }
         return new OperationResult(orderId, changed);
+    }
+
+    /** 单条预占扣减（独立事务 + 乐观锁重试）；返回是否真的发生了扣减。 */
+    private boolean deductOne(Long orderId, Long reservationId) {
+        return withOptimisticRetry("deduct", orderId, () -> {
+            StockReservation fresh = reservationRepository.findById(reservationId).orElse(null);
+            if (fresh == null || fresh.getStatus() != ReservationStatus.ACTIVE) {
+                return false;
+            }
+            Stock stock = stockRepository.findBySkuId(fresh.getSkuId())
+                    .orElseThrow(() -> new BizException(BizErrorCode.SYSTEM_ERROR,
+                            "库存记录丢失，需人工核对: skuId=" + fresh.getSkuId()));
+            requireLockedEnough(stock, fresh, "deduct");
+            stock.deduct(fresh.getQuantity());
+            stockRepository.saveAndFlush(stock);
+            fresh.moveTo(ReservationStatus.DEDUCTED);
+            reservationRepository.saveAndFlush(fresh);
+            AfterCommitEvents.publish(eventPublisher, DomainEventNames.INVENTORY_CHANGE,
+                    inventoryChange(fresh.getSkuId(), -fresh.getQuantity(), stock, "deduct", orderId));
+            return true;
+        });
     }
 
     // ------------------------------------------------------------------ 超时释放
@@ -227,9 +277,10 @@ public class InventoryService {
                 if (done) {
                     released++;
                 }
-            } catch (BizException e) {
-                // 单条失败不阻塞整轮扫描，下一轮重试
-                log.error("超时预占释放失败，下轮重试: reservationId={}", reservation.getId(), e);
+            } catch (RuntimeException e) {
+                // 单条失败不阻塞整轮扫描，下一轮重试（与 release/deduct 同样的逐条隔离口径）
+                log.error("[inventory-expire-release-failed] 超时预占释放失败，下轮重试: reservationId={} skuId={}",
+                        reservation.getId(), reservation.getSkuId(), e);
             }
         }
         return released;
@@ -267,6 +318,19 @@ public class InventoryService {
         }
         log.error("库存乐观锁冲突重试耗尽: op={} bizKey={}", op, bizKey, last);
         throw new BizException(BizErrorCode.OUT_OF_STOCK, "库存紧张，请稍后重试");
+    }
+
+    /**
+     * 账本下界保护：释放/扣减前确认 locked 覆盖本条预占数量。
+     * 预占单状态机（ACTIVE 单向流转）已保证重复调用不会二次扣减；这里再兜一层，
+     * 防止历史脏数据/并发把 locked 打成负数（负 locked = 凭空多出可售库存）。
+     */
+    private void requireLockedEnough(Stock stock, StockReservation reservation, String op) {
+        if (stock.getLockedStock() < reservation.getQuantity()) {
+            throw new BizException(BizErrorCode.SYSTEM_ERROR,
+                    "锁定库存不足（账本异常，需人工核对）: op=" + op + " skuId=" + stock.getSkuId()
+                            + " quantity=" + reservation.getQuantity() + " locked=" + stock.getLockedStock());
+        }
     }
 
     private Map<String, Object> inventoryChange(Long skuId, int delta, Stock stock, String bizType, Long orderId) {

@@ -25,13 +25,18 @@ public interface CouponTemplateRepository extends JpaRepository<CouponTemplate, 
             """)
     int reserveStock(@Param("id") Long id, @Param("now") Instant now);
 
-    /** 核销 +1。 */
-    @Modifying
+    /**
+     * 核销 +1。
+     *
+     * <p>{@code clearAutomatically}：批量更新绕过一级缓存，不清理时随后重读模板会拿到旧 usedCount
+     * 并原样返回给调用方（核销响应里 usedCount 假回退）。</p>
+     */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE CouponTemplate t SET t.usedCount = t.usedCount + 1, t.updatedAt = :now WHERE t.id = :id")
     int increaseUsedCount(@Param("id") Long id, @Param("now") Instant now);
 
     /** 关单退回 -1（usedCount>0 保护，防负数）。 */
-    @Modifying
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE CouponTemplate t SET t.usedCount = t.usedCount - 1, t.updatedAt = :now WHERE t.id = :id AND t.usedCount > 0")
     int decreaseUsedCount(@Param("id") Long id, @Param("now") Instant now);
 }

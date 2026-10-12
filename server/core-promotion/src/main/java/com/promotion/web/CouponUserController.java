@@ -1,6 +1,8 @@
 package com.promotion.web;
 
 import com.easyshopping.common.api.ApiResponse;
+import com.easyshopping.common.api.BizErrorCode;
+import com.easyshopping.common.api.BizException;
 import com.easyshopping.common.api.UserContext;
 import com.promotion.service.CouponService;
 import com.promotion.web.dto.CouponRecordResponse;
@@ -27,8 +29,11 @@ import java.util.List;
  * ② plans/android-backend.md P1 清单用单数路径。两路径完全等价，网关路由表补齐后可收敛为一个
  * （收敛属 gateway 模块，由其负责人处理）。</p>
  *
- * <p>鉴权：买家接口需登录（网关注入 X-User-Id）；deduct/release 允许服务端间调用（core-order
- * 下单/关单链路）——携带 X-User-Id 时校验归属，不携带时按内网信任放行（P0，对齐 DEV.md 4.5）。</p>
+ * <p><b>鉴权（P0-F 修复）</b>：全部接口要求登录，网关注入 {@code X-User-Id}（{@code UserContext}）。
+ * deduct/release <b>强制</b>携带身份并校验券主归属——原实现「不携带 X-User-Id 就按内网信任放行」
+ * 等于让任意能直连 8088 的调用方核销/退回他人券（水平越权）。服务端间调用改走
+ * {@link InternalCouponController}（{@code /api/v1/internal/coupons/{id}/deduct|release}，
+ * 共享密钥 + 内网可达）。</p>
  */
 @RestController
 public class CouponUserController {
@@ -63,13 +68,13 @@ public class CouponUserController {
     /** 核销（available → used + 绑定订单；条件更新防并发重复核销；同订单重试幂等）。 */
     @PostMapping({"/api/v1/coupons/deduct", "/api/v1/coupon/deduct"})
     public ApiResponse<CouponRecordResponse> deduct(@Valid @RequestBody DeductRequest request) {
-        return ApiResponse.ok(couponService.deduct(request.couponId(), request.orderId(), UserContext.userId()));
+        return ApiResponse.ok(couponService.deduct(request.couponId(), request.orderId(), requireBuyerUserId()));
     }
 
     /** 关单退回（used → available；幂等）。 */
     @PostMapping({"/api/v1/coupons/release", "/api/v1/coupon/release"})
     public ApiResponse<CouponRecordResponse> release(@Valid @RequestBody ReleaseRequest request) {
-        return ApiResponse.ok(couponService.release(request.couponId(), request.orderId(), UserContext.userId()));
+        return ApiResponse.ok(couponService.release(request.couponId(), request.orderId(), requireBuyerUserId()));
     }
 
     /** 我的券列表（status 可选：0可用/1已使用/2已过期）。 */
@@ -78,5 +83,20 @@ public class CouponUserController {
             @RequestParam(required = false) Integer status) {
         long userId = UserContext.requireUserId();
         return ApiResponse.ok(couponService.my(userId, status));
+    }
+
+    /**
+     * 券写操作的身份闸门：无 {@code X-User-Id} 一律 {@link BizErrorCode#NO_PERMISSION}（1004/403）。
+     *
+     * <p>刻意不用 {@code requireUserId()}（1002/401）：本接口的缺失身份意味着「调用方根本没表明
+     * 自己是哪个用户」，按权限问题归类比按登录态失效归类更准确，也避免客户端把 401 当成「Token 过期」
+     * 去刷新重试（刷新后仍然没有 X-User-Id，只会陷入循环）。</p>
+     */
+    private long requireBuyerUserId() {
+        Long userId = UserContext.userId();
+        if (userId == null) {
+            throw new BizException(BizErrorCode.NO_PERMISSION, "缺少用户身份（X-User-Id），无法操作优惠券");
+        }
+        return userId;
     }
 }

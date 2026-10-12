@@ -186,7 +186,18 @@ export function closeOrder(id: number, reason: string): Promise<{ success: boole
   return post(`/admin/order/${id}/close`, { reason }).then(() => ({ success: true }));
 }
 
-/* ------------------------------------------------------------ 退款售后（4.2.2） */
+/* ------------------------------------------------------------ 退款售后（plans/admin-backend 4.2.2） */
+
+/**
+ * 售后（退款/售后单）能力开关：**后端未实现**，P1 由 `admin-order` 拆分后的售后域提供
+ * （plans/00-架构总纲「演进阶段：21 个 admin-*」，其中不含 after-sale；server 侧无任何
+ * `after-sale` Controller，网关 `/api/admin/**` 兜底到 admin-bff 后必然 404）。
+ *
+ * 口径与 `ORDER_REMARK_AVAILABLE` 一致：仅 mock 环境放行（mock 已提供 `/api/admin/after-sale/*` 路由），
+ * `VITE_USE_MOCK=false` 直连真实后端时**关闭入口**（菜单 + 路由 + 按钮），页面给出显式说明，
+ * 不允许出现"能点进去但永远转圈/空表"的空转。
+ */
+export const AFTER_SALE_AVAILABLE = import.meta.env.VITE_USE_MOCK !== 'false';
 
 export interface AfterSaleItem {
   id: number;
@@ -209,20 +220,20 @@ export interface AfterSaleQuery extends PageQuery {
 }
 
 /**
- * 售后列表：GET /api/admin/after-sale/list
+ * 售后列表：GET /api/admin/after-sale/list（plans/admin-backend 4.2.2）
  * ❌ 后端未实现（server 侧无 after-sale Controller，网关兜底路由到 admin-bff 后 404）——
- * 仅 mock 提供，见 docs/api-contract-check.md
+ * 仅 mock 提供，真实后端下由 `AFTER_SALE_AVAILABLE` 关闭入口，见 docs/api-contract-check.md
  */
 export function listAfterSales(params: AfterSaleQuery): Promise<PageResult<AfterSaleItem>> {
-  return get('/after-sale/list', params);
+  return get('/admin/after-sale/list', params);
 }
 
 /** 审核通过：POST /api/admin/after-sale/{id}/approve（❌ 后端未实现，仅 mock） */
 export function approveAfterSale(id: number, note?: string): Promise<{ success: boolean }> {
-  return post(`/after-sale/${id}/approve`, { note });
+  return post(`/admin/after-sale/${id}/approve`, { note });
 }
 
 /** 审核拒绝：POST /api/admin/after-sale/{id}/reject（❌ 后端未实现，仅 mock；reason 必填） */
 export function rejectAfterSale(id: number, reason: string): Promise<{ success: boolean }> {
-  return post(`/after-sale/${id}/reject`, { reason });
+  return post(`/admin/after-sale/${id}/reject`, { reason });
 }

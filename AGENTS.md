@@ -18,6 +18,7 @@ web-buyer/        PC 买家端渲染层（React 19 + Tailwind，11 页，后续�
 miniprogram/      小程序（uni-app + Vue3，14 页，h5/mp-weixin 双构建）
 android-client/   安卓（Kotlin + Compose + MVI，13 路由，assembleDebug 可出 APK）
 ios-client/       iOS（SwiftUI 零三方依赖 + XcodeGen，Windows 无法编译，见其 README 声明）
+AUDIT/            代码质量与业务逻辑审计（README 总册 + 01后端/02前端/00主审深审）
 DEV.md            后端构建/运行/开发规范（Maven 全路径、端口表、事件与错误码规范）
 AGENTS.md         本文件
 ```
@@ -40,6 +41,18 @@ AGENTS.md         本文件
 | 签名窗口 | ±5 分钟 / Nonce TTL 10 分钟（android-backend 13.1；安卓端开关 `SIGN_ENABLED`，后端 P0 未开验签） |
 | MQ 事件 | 30 个事件名以 `common/DomainEventNames` 常量为准（P0 进程内分发，P1 接 RabbitMQ） |
 | 容量口径 | `plans/00-架构总纲.md`（含 22 层容量表、可用性 99.9%→P1 双活 99.95%、终审 7 项待决策） |
+
+### 审计后新增的行为约定（改代码前必读）
+
+`AUDIT/` 审计出 16 项 P0（4 项资金/权益级）并已全部修复，随之而来的行为约定：
+
+- **幂等语义已变**：`Idempotency-Key` 占位区分 `PROCESSING`/`SUCCESS`——**业务失败释放占位（同键可重试）**，系统异常/超时保留（防真实重复提交）。写「首次失败→重放应 409」的用例需按新语义更新。
+- **支付金额 fail-closed**：prepay 只认订单快照的 `payAmount`（**删除 totalAmount 回退**），缺失或 ≤0 直接 4002 拒绝、不落支付单。发布顺序必须 **core-order 先于 core-payment**。
+- **券接口双入口**：买家端 `/api/v1/coupons/*` 强制 `X-User-Id` 归属校验（缺失=1004/403）；服务间调用走 `/api/v1/internal/coupons/*` + `X-Internal-Token`（常量时间比较，**默认留空=拒绝全部**）。
+- **密码哈希 PBKDF2-HMAC-SHA256 21 万次迭代**（格式 `pbkdf2_sha256$iterations$salt$hash`，兼容旧 `s256$`，登录时自动 rehash 升级）。
+- **退款语义**：`PaymentClient.refund` 返回"是否被支付域受理"；**仅受理成功才发 `ORDER_REFUND_APPLIED` 事件**，失败只告警不打断关单。
+- **订单隐私**：收货人手机号一律脱敏；`internalOrder` 目前返回整实体（含明文），P1 应收窄为字段快照。
+- **⚠️ 放开商品编辑入口前须书面确认**：`PUT /api/admin/product/{id}` 是 SKU 全量替换，会清空 `costPrice`（审计登记项）。
 
 ### 陷阱
 

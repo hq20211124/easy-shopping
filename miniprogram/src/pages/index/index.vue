@@ -8,6 +8,8 @@ import type { HotWord, ProductListItem } from '@/api/types'
 /** 首页：搜索入口 + 分类导航（静态 P0）+ 热搜词 + 推荐流（真实 /api/v1/products 分页）。 */
 const hotWords = ref<HotWord[]>([])
 const feed = ref<ProductListItem[]>([])
+/** 推荐流加载失败：区分"暂无商品"与"接口挂了"，避免加载失败时显示空列表误导用户 */
+const feedFailed = ref(false)
 const page = ref(1)
 const loading = ref(false)
 const noMore = ref(false)
@@ -22,6 +24,7 @@ const categories = [
 async function loadFeed(reset = false) {
   if (loading.value || (!reset && noMore.value)) return
   loading.value = true
+  if (reset) feedFailed.value = false
   try {
     if (reset) {
       page.value = 1
@@ -31,6 +34,11 @@ async function loadFeed(reset = false) {
     feed.value = reset ? res.list : [...feed.value, ...res.list]
     noMore.value = feed.value.length >= res.total
     page.value++
+  } catch (e) {
+    // toast 已由请求层统一弹出；首页失败时明确标记空态为"加载失败"而非"暂无商品"
+    // （不置 noMore：已有数据时仍允许上拉重试）
+    void e
+    feedFailed.value = true
   } finally {
     loading.value = false
   }
@@ -49,15 +57,29 @@ function goDetail(spuId: number) {
 }
 
 onPullDownRefresh(async () => {
-  await Promise.all([loadFeed(true), searchApi.hot(5).then((h) => (hotWords.value = h)).catch(() => undefined)])
+  await Promise.all([
+    loadFeed(true),
+    searchApi
+      .hot(5)
+      .then((h) => (hotWords.value = h))
+      .catch(() => {
+        // 热搜为增强信息，失败不阻塞首页（toast 已由请求层弹出）
+        hotWords.value = []
+      }),
+  ])
   uni.stopPullDownRefresh()
 })
 
-onReachBottom(() => loadFeed())
+onReachBottom(() => void loadFeed())
 
 // 首次加载
-loadFeed(true)
-searchApi.hot(5).then((h) => (hotWords.value = h)).catch(() => undefined)
+void loadFeed(true)
+searchApi
+  .hot(5)
+  .then((h) => (hotWords.value = h))
+  .catch(() => {
+    hotWords.value = []
+  })
 </script>
 
 <template>
@@ -101,7 +123,15 @@ searchApi.hot(5).then((h) => (hotWords.value = h)).catch(() => undefined)
         </view>
       </view>
     </view>
-    <view v-if="noMore && feed.length" class="home__no-more">— 已经到底啦 —</view>
+    <ec-empty
+      v-if="feedFailed && !feed.length"
+      icon="📡"
+      text="推荐商品加载失败，请检查网络后重试"
+      action-text="重新加载"
+      @action="loadFeed(true)"
+    />
+    <ec-empty v-else-if="!loading && !feed.length" icon="🛍️" text="暂无推荐商品" />
+    <view v-if="noMore && feed.length && !feedFailed" class="home__no-more">— 已经到底啦 —</view>
   </view>
 </template>
 

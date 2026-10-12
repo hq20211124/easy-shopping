@@ -7,7 +7,6 @@ import path from 'node:path';
 
 const BASE = 'http://localhost:5173'; // dev proxy（真实模式）
 const DIRECT_USER = 'http://127.0.0.1:8081';
-const DIRECT_INV = 'http://127.0.0.1:8084';
 
 const stamp = Date.now();
 const uid = String(stamp).slice(-8);
@@ -199,7 +198,7 @@ const putBody = (priceOverride) => ({
   images: detail1.data.images?.join(',') || undefined,
   video: detail1.data.video,
   detail: detail1.data.detail,
-  skus: skus1.map((s, i) => ({
+  skus: skus1.map((s) => ({
     skuCode: s.skuCode,
     title: s.title,
     spec: s.specs,

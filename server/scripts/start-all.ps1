@@ -80,7 +80,9 @@ $UrlOverrides = @(
 function Test-ServiceHealth {
     param([int]$Port)
     try {
-        $null = Invoke-WebRequest -Uri ("http://127.0.0.1:{0}/health" -f $Port) -UseBasicParsing -TimeoutSec 3
+        # 10s 而非 3s：11 个 JVM 同时冷启动会吃满 CPU（Spring Boot 启动 30~40s），
+        # 过短的探测超时会把"还在启动"误判为"起不来"。
+        $null = Invoke-WebRequest -Uri ("http://127.0.0.1:{0}/health" -f $Port) -UseBasicParsing -TimeoutSec 10
         return $true
     } catch {
         return $false

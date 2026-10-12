@@ -9,6 +9,7 @@
  * BasicLayout 优先使用后端下发的菜单树；接口异常/空返回时回退本文件的静态配置（两者菜单结构一致）。
  */
 import type { PermissionMenuItem } from '@/utils/permission';
+import { AFTER_SALE_AVAILABLE } from '@/api/order';
 
 export const MENUS: PermissionMenuItem[] = [
   { key: 'dashboard', label: '工作台', path: '/dashboard' },
@@ -24,7 +25,10 @@ export const MENUS: PermissionMenuItem[] = [
     permission: 'order:list',
     children: [
       { key: 'order:list', label: '订单列表', path: '/order/list', permission: 'order:list' },
-      { key: 'order:refund', label: '退款/售后', path: '/order/refund', permission: 'refund:list' },
+      // 售后域后端未实现（P1），真实后端下隐藏入口，避免"点得进、取不到数"
+      ...(AFTER_SALE_AVAILABLE
+        ? [{ key: 'order:refund', label: '退款/售后', path: '/order/refund', permission: 'refund:list' }]
+        : []),
     ],
   },
   {

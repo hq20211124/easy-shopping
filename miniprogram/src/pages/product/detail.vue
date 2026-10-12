@@ -10,6 +10,8 @@ import { useCheckoutStore } from '@/store/checkout'
 
 /** 商品详情：swiper 图集 + 多规格 SKU 矩阵 + 加购/立即购买。 */
 const product = ref<ProductDetail | null>(null)
+/** 加载失败/参数无效：显式错误态，避免只剩空 swiper 与无效按钮的"白屏" */
+const failed = ref(false)
 const skuVisible = ref(false)
 const skuMode = ref<'cart' | 'buy'>('cart')
 const cartStore = useCartStore()
@@ -20,12 +22,21 @@ const adding = ref(false)
 const images = computed(() => product.value?.images?.length ? product.value.images : [product.value?.mainImage || ''])
 
 async function load(spuId: number) {
+  failed.value = false
   try {
     product.value = await productApi.detail(spuId)
   } catch (e) {
-    // 3001 不存在 / 3003 未上架：toast 已由请求层处理
+    // 3001 不存在 / 3003 未上架 / 网络异常：toast 已由请求层处理，这里补可退出的错误态
     void e
+    product.value = null
+    failed.value = true
   }
+}
+
+function goBack() {
+  const pages = getCurrentPages()
+  if (pages.length > 1) uni.navigateBack()
+  else uni.switchTab({ url: '/pages/index/index' })
 }
 
 function requireLogin(): boolean {
@@ -87,7 +98,13 @@ async function handleSku(payload: { sku: ProductSku; quantity: number }, mode = 
 
 onLoad((options) => {
   const spuId = Number(options?.spuId || 0)
-  if (spuId) load(spuId)
+  if (!spuId) {
+    // 入口传错参数（如误传 skuId）时不再静默白屏：置错误态 + 提示，从购物车/搜索列表重新进入即可
+    failed.value = true
+    uni.showToast({ title: '商品参数无效，请重新进入', icon: 'none' })
+    return
+  }
+  load(spuId)
 })
 
 onShareAppMessage(() => ({
@@ -98,52 +115,62 @@ onShareAppMessage(() => ({
 
 <template>
   <view class="detail">
-    <swiper v-if="images.length" class="detail__gallery" indicator-dots circular>
-      <swiper-item v-for="(img, i) in images" :key="i">
-        <image class="detail__gallery-img" :src="img" mode="aspectFill" />
-      </swiper-item>
-    </swiper>
-
-    <view v-if="product" class="detail__card">
-      <view class="detail__price-row">
-        <ec-price :value="product.price" size="lg" />
-        <text v-if="product.originalPrice" class="detail__origin">¥{{ product.originalPrice }}</text>
-        <text class="detail__sales">已售{{ product.salesCount ?? 0 }}</text>
-      </view>
-      <view class="detail__title">{{ product.name }}</view>
-      <view v-if="product.subtitle" class="detail__subtitle">{{ product.subtitle }}</view>
-
-      <view class="detail__spec-entry" @click="openSku('cart')">
-        <text class="detail__spec-label">选择</text>
-        <text class="detail__spec-value">
-          {{ product.specs.map((s) => s.name).join(' / ') || '规格' }} ▾
-        </text>
-      </view>
-    </view>
-
-    <view v-if="product?.detail" class="detail__section">
-      <view class="detail__section-title">商品详情</view>
-      <!-- 富文本：小程序端用 rich-text 渲染（服务端已做 XSS 处理口径） -->
-      <rich-text :nodes="product.detail" />
-    </view>
-
-    <view class="detail__placeholder" />
-
-    <view class="detail__bar">
-      <view class="detail__bar-icon" @click="goCart">
-        🛒
-        <text class="detail__bar-badge" v-if="cartStore.count > 0">{{ cartStore.count > 99 ? '99+' : cartStore.count }}</text>
-      </view>
-      <button class="detail__bar-btn detail__bar-btn--cart" @click="onAction('cart')">加入购物车</button>
-      <button class="detail__bar-btn detail__bar-btn--buy" @click="onAction('buy')">立即购买</button>
-    </view>
-
-    <ec-sku-matrix
-      v-model:visible="skuVisible"
-      :product="product"
-      :confirm-text="skuMode === 'cart' ? '加入购物车' : '立即购买'"
-      @confirm="handleSku"
+    <ec-empty
+      v-if="failed"
+      icon="🚧"
+      text="商品加载失败或已下架"
+      action-text="返回"
+      @action="goBack"
     />
+    <template v-else>
+      <swiper v-if="images.length" class="detail__gallery" indicator-dots circular>
+        <swiper-item v-for="(img, i) in images" :key="i">
+          <image class="detail__gallery-img" :src="img" mode="aspectFill" />
+        </swiper-item>
+      </swiper>
+
+      <view v-if="product" class="detail__card">
+        <view class="detail__price-row">
+          <ec-price :value="product.price" size="lg" />
+          <text v-if="product.originalPrice" class="detail__origin">¥{{ product.originalPrice }}</text>
+          <text class="detail__sales">已售{{ product.salesCount ?? 0 }}</text>
+        </view>
+        <view class="detail__title">{{ product.name }}</view>
+        <view v-if="product.subtitle" class="detail__subtitle">{{ product.subtitle }}</view>
+
+        <view class="detail__spec-entry" @click="openSku('cart')">
+          <text class="detail__spec-label">选择</text>
+          <text class="detail__spec-value">
+            {{ product.specs.map((s) => s.name).join(' / ') || '规格' }} ▾
+          </text>
+        </view>
+      </view>
+
+      <view v-if="product?.detail" class="detail__section">
+        <view class="detail__section-title">商品详情</view>
+        <!-- 富文本：小程序端用 rich-text 渲染（服务端已做 XSS 处理口径） -->
+        <rich-text :nodes="product.detail" />
+      </view>
+
+      <view class="detail__placeholder" />
+
+      <!-- 无商品数据时不渲染底部操作条：按钮点了也不会有任何动作（静默空转） -->
+      <view class="detail__bar" v-if="product">
+        <view class="detail__bar-icon" @click="goCart">
+          🛒
+          <text class="detail__bar-badge" v-if="cartStore.count > 0">{{ cartStore.count > 99 ? '99+' : cartStore.count }}</text>
+        </view>
+        <button class="detail__bar-btn detail__bar-btn--cart" @click="onAction('cart')">加入购物车</button>
+        <button class="detail__bar-btn detail__bar-btn--buy" @click="onAction('buy')">立即购买</button>
+      </view>
+
+      <ec-sku-matrix
+        v-model:visible="skuVisible"
+        :product="product"
+        :confirm-text="skuMode === 'cart' ? '加入购物车' : '立即购买'"
+        @confirm="handleSku"
+      />
+    </template>
   </view>
 </template>
 

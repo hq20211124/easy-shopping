@@ -18,6 +18,7 @@ import {
 import { DATA_SCOPE_OPTIONS } from '@/config/constants';
 import { AuthButton } from '@/components/AuthButton';
 import { PageLoading } from '@/components/PageLoading';
+import { QueryErrorText } from '@/components/QueryError';
 import { normalizePage } from '@/utils/query';
 
 /** 权限点树 → antd Tree 数据 */
@@ -47,13 +48,19 @@ export default function UserRoles() {
 
   const pageQuery = useMemo(() => normalizePage(pageNum, pageSize), [pageNum, pageSize]);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['roles', pageQuery],
     queryFn: () => listRoles(pageQuery),
     placeholderData: (prev) => prev,
   });
 
-  const { data: tree, isLoading: treeLoading } = useQuery({
+  const {
+    data: tree,
+    isLoading: treeLoading,
+    isError: treeError,
+    error: treeErrorValue,
+    refetch: refetchTree,
+  } = useQuery({
     queryKey: ['permission-tree'],
     queryFn: getPermissionTree,
   });
@@ -70,10 +77,16 @@ export default function UserRoles() {
 
   const openDrawer = async (row: Role) => {
     setActiveRole(row);
-    const { permissions } = await getRolePermissions(row.id);
-    const leaves = new Set(collectLeafKeys(tree ?? []));
-    // 只回显权限点（叶子）key，菜单 key 交由 Tree 自动勾选父级
-    setCheckedKeys(permissions.filter((p) => leaves.has(p)));
+    try {
+      const { permissions } = await getRolePermissions(row.id);
+      const leaves = new Set(collectLeafKeys(tree ?? []));
+      // 只回显权限点（叶子）key，菜单 key 交由 Tree 自动勾选父级
+      setCheckedKeys(permissions.filter((p) => leaves.has(p)));
+    } catch (err) {
+      // 拉取已授权失败时不能让抽屉开出一个"全未勾选"的假象，用户一保存就会覆盖权限
+      message.error(`读取角色权限失败：${(err as Error | null)?.message ?? '未知错误'}`);
+      setCheckedKeys([]);
+    }
   };
 
   const columns: TableColumnsType<Role> = [
@@ -112,6 +125,8 @@ export default function UserRoles() {
           loading={isLoading}
           columns={columns}
           dataSource={data?.list}
+          // 「加载失败」≠「没有角色」：显式错误文案 + 重试入口
+          locale={{ emptyText: isError ? <QueryErrorText error={error} onRetry={() => void refetch()} /> : '暂无角色' }}
           scroll={{ x: 1000 }}
           pagination={{
             current: data?.pageNum ?? pageNum,
@@ -152,6 +167,8 @@ export default function UserRoles() {
       >
         {treeLoading ? (
           <PageLoading />
+        ) : treeError ? (
+          <QueryErrorText error={treeErrorValue} onRetry={() => void refetchTree()} />
         ) : (
           <>
             <Typography.Paragraph type="secondary">

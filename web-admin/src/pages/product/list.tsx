@@ -34,6 +34,7 @@ import {
 import { AUDIT_STATUS_OPTIONS, BATCH_MAX, SHELF_STATUS_OPTIONS } from '@/config/constants';
 import { StatusTag } from '@/components/StatusTag';
 import { AuthButton } from '@/components/AuthButton';
+import { QueryErrorText } from '@/components/QueryError';
 import { usePermission } from '@/hooks/usePermission';
 import { formatAmount, formatNumber } from '@/utils/format';
 import { normalizePage } from '@/utils/query';
@@ -53,7 +54,7 @@ export default function ProductList() {
   const [pageSize, setPageSize] = useState(10);
   const [selectedKeys, setSelectedKeys] = useState<number[]>([]);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['products', filters, pageNum, pageSize],
     queryFn: () => listProducts({ ...normalizePage(pageNum, pageSize), ...filters }),
     placeholderData: (prev) => prev, // 翻页时保留上一页数据，避免表格闪烁
@@ -230,6 +231,8 @@ export default function ProductList() {
         loading={isLoading}
         columns={columns}
         dataSource={data?.list}
+        // 「加载失败」≠「没有商品」：显式错误文案 + 重试入口
+        locale={{ emptyText: isError ? <QueryErrorText error={error} onRetry={() => void refetch()} /> : '暂无商品' }}
         scroll={{ x: 1300 }}
         rowSelection={{
           selectedRowKeys: selectedKeys,

@@ -31,7 +31,8 @@ export default tseslint.config(
     },
   },
   {
-    files: ['mock/**/*.ts', 'vite.config.ts'],
+    // Node 侧脚本（mock 拦截器 / vite 配置 / 活体联调脚本）使用 Node 全局（console/process/fetch/setTimeout）
+    files: ['mock/**/*.ts', 'vite.config.ts', 'scripts/**/*.mjs'],
     languageOptions: { globals: globals.node },
   },
   prettier,

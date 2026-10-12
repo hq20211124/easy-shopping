@@ -18,8 +18,9 @@ import java.time.Instant;
 /**
  * 订单服务 RestClient 实现（静态地址，P0 无 Nacos；超时 连接1s/读3s，见 DEV.md 3）。
  *
- * <p>响应解析做了字段兜底（orderId/id、totalAmount/payAmount/amount），因为 core-order 与本模块
- * 并行开发，契约字段以 core-order README 定稿为准；定稿后收敛为单一字段并删除兜底（TODO）。</p>
+ * <p><b>金额字段口径</b>：定额一律取 {@code payAmount}（应付 = 商品总额 - 优惠 + 运费），
+ * {@code totalAmount}（优惠前）仅作为参考字段透传，<b>禁止</b>回退到它——
+ * 回退等于按商品总额收款，有券订单会多收一个券面额（P0-1）。</p>
  */
 @Component
 public class RestOrderClient implements OrderClient {
@@ -93,17 +94,18 @@ public class RestOrderClient implements OrderClient {
                 "订单服务返回错误（" + action + "）code=" + code + " msg=" + body.path("msg").asText());
     }
 
-    /** 字段兜底解析（core-order 契约定稿后收敛，TODO 见类注释）。 */
+    /** 字段解析：金额<b>只认 payAmount（应付）</b>，缺失即报错而非回退到 totalAmount（防多收费）。 */
     private OrderSnapshot toSnapshot(JsonNode data) {
         Long orderId = firstLong(data, "orderId", "id");
         Long userId = firstLong(data, "userId");
-        BigDecimal amount = firstDecimal(data, "totalAmount", "payAmount", "amount");
+        BigDecimal totalAmount = firstDecimal(data, "totalAmount"); // 仅参考，不参与定额
+        BigDecimal payAmount = firstDecimal(data, "payAmount", "amount");
         Integer status = data.hasNonNull("status") ? data.get("status").asInt() : null;
         Instant payDeadline = firstInstant(data, "payDeadline");
-        if (orderId == null || amount == null) {
-            throw new BizException(BizErrorCode.SYSTEM_ERROR, "订单服务响应缺少必要字段 orderId/totalAmount");
+        if (orderId == null || payAmount == null) {
+            throw new BizException(BizErrorCode.SYSTEM_ERROR, "订单服务响应缺少必要字段 orderId/payAmount");
         }
-        return new OrderSnapshot(orderId, userId, amount, status, payDeadline);
+        return new OrderSnapshot(orderId, userId, totalAmount, payAmount, status, payDeadline);
     }
 
     private Long firstLong(JsonNode node, String... fields) {

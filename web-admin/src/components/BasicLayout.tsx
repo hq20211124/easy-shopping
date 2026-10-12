@@ -21,12 +21,16 @@ import {
 } from '@ant-design/icons';
 import { MENUS } from '@/config/menus';
 import { getMenus, type AdminMenuNode } from '@/api/auth';
+import { AFTER_SALE_AVAILABLE } from '@/api/order';
 import { filterMenuByPermission, type PermissionMenuItem } from '@/utils/permission';
 import { usePermission } from '@/hooks/usePermission';
 import { useAuthStore } from '@/stores/auth';
 import { registerAuthHandlers } from '@/api/request';
 
 const COLLAPSE_KEY = 'admin_sidebar_collapsed';
+
+/** 后端未实现的售后域入口（AFTER_SALE_AVAILABLE=false 时下线，后端菜单树与静态菜单都要过滤） */
+const HIDDEN_MENU_PATHS = new Set<string>(AFTER_SALE_AVAILABLE ? [] : ['/order/refund']);
 
 const ICON_MAP: Record<string, React.ReactNode> = {
   dashboard: <BarChartOutlined />,
@@ -44,6 +48,20 @@ function toPermissionMenus(nodes: AdminMenuNode[]): PermissionMenuItem[] {
     permission: node.permission ?? undefined,
     children: node.children?.length ? toPermissionMenus(node.children) : undefined,
   }));
+}
+
+/**
+ * 功能开关下线：剔除后端未实现域的菜单项。
+ * 后端 `DataInitializer` 仍会下发 `/order/refund`（权限点注册表已预埋），前端必须自行下线，
+ * 否则菜单里会留下一个"点得进、取不到数"的入口。
+ */
+function hideDisabledMenus(items: PermissionMenuItem[]): PermissionMenuItem[] {
+  return items.flatMap((item) => {
+    if (item.path && HIDDEN_MENU_PATHS.has(item.path)) return [];
+    const children = item.children?.length ? hideDisabledMenus(item.children) : undefined;
+    if (item.children?.length && !children?.length && !item.permission) return [];
+    return [{ ...item, children }];
+  });
 }
 
 interface AppRouteHandle {
@@ -99,7 +117,7 @@ export default function BasicLayout() {
   );
 
   const menuItems = useMemo(() => {
-    const visible = filterMenuByPermission(sourceMenus, permissions);
+    const visible = filterMenuByPermission(hideDisabledMenus(sourceMenus), permissions);
     const toItems = (items: PermissionMenuItem[]): MenuProps['items'] =>
       items.map((item) =>
         item.children?.length
@@ -117,7 +135,7 @@ export default function BasicLayout() {
         if (m.path) flat.push(m.path);
         if (m.children?.length) walk(m.children);
       });
-    walk(filterMenuByPermission(sourceMenus, permissions));
+    walk(filterMenuByPermission(hideDisabledMenus(sourceMenus), permissions));
     const section = `/${location.pathname.split('/')[1]}/`;
     // 精确匹配优先；详情页（/product/1001 等）回退到所属模块的列表菜单
     return (

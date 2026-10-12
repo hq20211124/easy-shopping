@@ -5,6 +5,8 @@
  *  - 401 → 并发刷新等待队列（只触发一次刷新，成功统一重放；失败清空状态跳登录并保留 redirect）
  *  - 403 → 立即重新拉取权限（由注册的回调触发），并提示无权限
  *  - 业务错误码兜底文案（server/common/BizErrorCode；后端 msg 优先，本表仅在 msg 缺失时兜底）
+ *  - 错误 toast 由拦截器统一弹出；**页面侧**用 `components/QueryError` 区分「无数据」与「加载失败」，
+ *    避免请求失败后只剩空表格/永久骨架屏（静默失败治理）
  *  - 写接口（POST/PUT/PATCH/DELETE）自动补 Idempotency-Key 请求头：
  *    server/common/idempotent/IdempotentInterceptor 校验 —— 缺失 → 1001 参数错误，重复 → 1005 幂等冲突
  *
@@ -95,7 +97,7 @@ function refreshAccessToken(): Promise<string> {
       .then((res) => {
         const body = res.data as ApiResponse<{ accessToken: string }>;
         const token = body?.data?.accessToken;
-        if (!token) throw new ApiError(body?.code ?? 401, body?.message ?? body?.msg ?? '刷新登录失败');
+        if (!token) throw new ApiError(body?.code ?? 401, body?.msg || '刷新登录失败');
         tokenStore.set(token);
         return token;
       })
@@ -127,11 +129,10 @@ http.interceptors.request.use((config) => {
   return config;
 });
 
-/** 错误文案：后端 msg 优先（server ApiResponse.msg），缺失时按 BizErrorCode 码表兜底 */
+/** 错误文案：后端 msg 唯一来源（server ApiResponse.msg），缺失时按 BizErrorCode 码表兜底 */
 function extractMessage(body: unknown, fallback: string, code?: number): string {
-  if (body && typeof body === 'object' && ('msg' in body || 'message' in body)) {
-    const envelope = body as ApiResponse;
-    const msg = envelope.msg ?? envelope.message;
+  if (body && typeof body === 'object' && 'msg' in body) {
+    const msg = (body as ApiResponse).msg;
     if (msg) return msg;
   }
   if (code !== undefined && ERROR_CODE_TEXT[code]) return ERROR_CODE_TEXT[code];

@@ -12,7 +12,10 @@ import com.payment.repo.PaymentOrderRepository;
 import com.payment.web.dto.PaymentStatusResponse;
 import com.payment.web.dto.PrepayResponse;
 import com.payment.web.dto.RefundResponse;
-import org.springframework.dao.DataIntegrityViolationException;import org.springframework.stereotype.Service;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -24,11 +27,15 @@ import java.util.Map;
 /**
  * 支付核心服务：预支付 / mock 支付 / 查单 / 退款。
  *
- * <p><b>防改价（裁决 C7）</b>：支付金额一律来自订单服务反查（{@code OrderClient#getOrder}），
- * prepay 只收 orderId，客户端传入的金额字段被忽略；渠道回调再做金额二次校验（见 {@link PaymentNotifyService}）。</p>
+ * <p><b>防改价（裁决 C7）</b>：支付金额一律来自订单服务反查（{@code OrderClient#getOrder}）的
+ * <b>应付金额 {@code payAmount}</b>（= 商品总额 - 优惠 + 运费），prepay 只收 orderId，
+ * 客户端传入的金额字段被忽略；渠道回调再做金额二次校验（见 {@link PaymentNotifyService}）。
+ * 严禁改用 {@code totalAmount}（优惠前）定额——用券订单会被多收一个券面额（P0-1）。</p>
  */
 @Service
 public class PaymentService {
+
+    private static final Logger log = LoggerFactory.getLogger(PaymentService.class);
 
     /** 支付超时兜底（分钟）：仅当订单服务未返回 pay_deadline 时使用；
      *  唯一事实来源是订单表 pay_deadline（分钟数为待产品确认参数，建议 30，见 ios-backend 支付超时行）。 */
@@ -69,6 +76,14 @@ public class PaymentService {
         if (order.userId() != null && order.userId() != userId) {
             throw new BizException(BizErrorCode.NO_PERMISSION, "无权支付他人订单");
         }
+        // 定额口径 = 应付金额（商品总额 - 优惠 + 运费）；缺失或非正数的异常订单一律拒绝预支付，
+        // 绝不回退到 totalAmount（优惠前）——那会让用券订单按商品总额收款，用户被多收一个券面额。
+        BigDecimal payAmount = order.payAmount();
+        if (payAmount == null || payAmount.signum() <= 0) {
+            logPayAmountRejected(order, payAmount);
+            throw new BizException(BizErrorCode.ORDER_STATUS_ERROR,
+                    "订单应付金额异常（" + payAmount + "），禁止支付，请联系客服 orderId=" + orderId);
+        }
 
         PaymentOrder existing = paymentRepo.findByOrderId(orderId).orElse(null);
         if (existing != null) {
@@ -80,7 +95,7 @@ public class PaymentService {
         payment.setOrderId(orderId);
         payment.setUserId(userId);
         payment.setChannel(channel);
-        payment.setAmount(order.totalAmount());
+        payment.setAmount(payAmount);
         payment.setStatus(PaymentOrder.STATUS_PENDING);
         payment.setOrderPaidNotified(false);
         try {
@@ -104,6 +119,12 @@ public class PaymentService {
             default -> throw new BizException(BizErrorCode.PAYMENT_FAILED,
                     "订单退款中/已退款，不能再次支付 status=" + payment.statusText());
         }
+    }
+
+    /** 应付金额异常告警（数据不一致/上游字段漂移，宁可拒付也不按错误金额收款）。 */
+    private void logPayAmountRejected(OrderSnapshot order, BigDecimal payAmount) {
+        log.error("[支付告警] 订单应付金额异常，拒绝预支付 orderId={} payAmount={} totalAmount={} status={}",
+                order.orderId(), payAmount, order.totalAmount(), order.status());
     }
 
     private PrepayResponse toPrepayResponse(PaymentOrder payment, Instant payDeadline) {

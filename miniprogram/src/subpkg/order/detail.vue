@@ -8,20 +8,45 @@ import type { Money, OrderDetailVO } from '@/api/types'
 
 /** 订单详情：子单分组、pay_deadline 倒计时（C7）、服务端 actions 驱动操作。 */
 const order = ref<OrderDetailVO | null>(null)
+const orderId = ref(0)
+/** 加载失败：显式错误态（原先 load 抛错后 order 恒 null，模板 v-if 不渲染 → 整页空白且无任何提示） */
+const failed = ref(false)
 const countdown = useCountdown()
 
 onLoad((options) => {
-  const orderId = Number(options?.orderId || 0)
-  if (orderId) load(orderId)
+  orderId.value = Number(options?.orderId || 0)
+  if (!orderId.value) {
+    failed.value = true
+    uni.showToast({ title: '订单参数无效', icon: 'none' })
+    return
+  }
+  void load()
 })
 
 onShow(() => {
-  if (order.value) load(order.value.orderId)
+  if (order.value) void load()
 })
 
-async function load(orderId: number) {
-  order.value = await orderApi.detail(orderId)
-  if (order.value.status === 0) countdown.start(order.value.payDeadline)
+async function load() {
+  if (!orderId.value) return
+  failed.value = false
+  try {
+    order.value = await orderApi.detail(orderId.value)
+    if (order.value.status === 0) countdown.start(order.value.payDeadline)
+  } catch (e) {
+    // toast 已由请求层统一弹出；显式置错误态，禁止静默空白页
+    void e
+    order.value = null
+    failed.value = true
+  }
+}
+
+function retry() {
+  if (!orderId.value) {
+    uni.navigateBack()
+    return
+  }
+  void load()
 }
 
 function goPay(orderId: number, payAmount: Money) {
@@ -32,14 +57,14 @@ async function onCancel() {
   const r = await uni.showModal({ title: '取消订单', content: '确定取消该订单吗？' })
   if (!r.confirm || !order.value) return
   await orderApi.cancel(order.value.orderId)
-  await load(order.value.orderId)
+  await load()
 }
 
 async function onConfirm() {
   const r = await uni.showModal({ title: '确认收货', content: '确认已收到商品吗？' })
   if (!r.confirm || !order.value) return
   await orderApi.confirm(order.value.orderId)
-  await load(order.value.orderId)
+  await load()
 }
 
 function onAction(action: { type: string; text: string }) {
@@ -52,84 +77,88 @@ function onAction(action: { type: string; text: string }) {
 </script>
 
 <template>
-  <view class="detail" v-if="order">
-    <view class="status card">
-      <view class="st">{{ order.statusText }}</view>
-      <view class="cd" v-if="order.status === 0 && !countdown.expired">
-        支付剩余 {{ countdown.text }}
-      </view>
-    </view>
+  <view class="detail">
+    <ec-empty v-if="failed" icon="📡" text="订单加载失败或订单不存在" action-text="重试" @action="retry" />
 
-    <view class="card addr">
-      <view class="row">
-        <text class="name">{{ order.receiverName }}</text>
-        <text class="mobile">{{ order.receiverMobile }}</text>
-      </view>
-      <view class="addr-detail">{{ order.receiverAddress }}</view>
-    </view>
-
-    <view class="card" v-if="order.children?.length">
-      <view class="sec-title">子订单（{{ order.children.length }}）</view>
-      <view class="row child" v-for="c in order.children" :key="c.orderId">
-        <view class="mid">
-          <view class="cno">{{ c.orderNo }}</view>
-          <text class="cst">{{ c.statusText }}</text>
-        </view>
-        <ec-price :value="c.payAmount" :size="28" />
-      </view>
-    </view>
-
-    <view class="card">
-      <view class="sec-title">商品</view>
-      <view class="row item" v-for="it in order.items" :key="it.orderId + '-' + it.skuId">
-        <image class="cover" :src="it.skuImage" mode="aspectFill" />
-        <view class="mid">
-          <view class="title">{{ it.skuName }}</view>
-          <text class="qty">×{{ it.quantity }}</text>
-        </view>
-        <ec-price :value="it.price" :size="26" />
-      </view>
-    </view>
-
-    <view class="card">
-      <view class="sec-title">金额明细</view>
-      <view class="row amt"><text>商品金额</text><text>¥{{ fmtMoney(order.amountDetail.goodsAmount) }}</text></view>
-      <view class="row amt"><text>运费</text><text>¥{{ fmtMoney(order.amountDetail.freightAmount) }}</text></view>
-      <view class="row amt"><text>优惠</text><text class="red">-¥{{ fmtMoney(order.amountDetail.discountAmount) }}</text></view>
-      <view class="row amt strong"><text>实付</text><ec-price :value="order.amountDetail.payAmount" :size="32" /></view>
-    </view>
-
-    <view class="card">
-      <view class="sec-title">订单信息</view>
-      <view class="row meta"><text>订单号</text><text class="mono">{{ order.orderNo }}</text></view>
-      <view class="row meta"><text>下单时间</text><text>{{ fmtDateTime(order.createdAt) }}</text></view>
-      <view class="row meta" v-if="order.payTime"><text>支付时间</text><text>{{ fmtDateTime(order.payTime) }}</text></view>
-      <view class="row meta" v-if="order.remark"><text>备注</text><text>{{ order.remark }}</text></view>
-    </view>
-
-    <view class="card" v-if="order.timeline?.length">
-      <view class="sec-title">订单动态</view>
-      <view class="row tl" v-for="(t, i) in order.timeline" :key="i">
-        <view class="tl-mid">
-          <view class="tl-title">{{ t.toStatusText }}</view>
-          <text class="tl-time">{{ fmtDateTime(t.time) }}</text>
+    <template v-else-if="order">
+      <view class="status card">
+        <view class="st">{{ order.statusText }}</view>
+        <view class="cd" v-if="order.status === 0 && !countdown.expired">
+          支付剩余 {{ countdown.text }}
         </view>
       </view>
-    </view>
 
-    <view class="placeholder"></view>
-
-    <view class="bar row" v-if="order.actions?.length">
-      <view
-        class="op"
-        :class="{ primary: a.type === 'pay' }"
-        v-for="a in order.actions"
-        :key="a.type"
-        @click="onAction(a)"
-      >
-        {{ a.text }}
+      <view class="card addr">
+        <view class="row">
+          <text class="name">{{ order.receiverName }}</text>
+          <text class="mobile">{{ order.receiverMobile }}</text>
+        </view>
+        <view class="addr-detail">{{ order.receiverAddress }}</view>
       </view>
-    </view>
+
+      <view class="card" v-if="order.children?.length">
+        <view class="sec-title">子订单（{{ order.children.length }}）</view>
+        <view class="row child" v-for="c in order.children" :key="c.orderId">
+          <view class="mid">
+            <view class="cno">{{ c.orderNo }}</view>
+            <text class="cst">{{ c.statusText }}</text>
+          </view>
+          <ec-price :value="c.payAmount" :size="28" />
+        </view>
+      </view>
+
+      <view class="card">
+        <view class="sec-title">商品</view>
+        <view class="row item" v-for="it in order.items" :key="it.orderId + '-' + it.skuId">
+          <image class="cover" :src="it.skuImage" mode="aspectFill" />
+          <view class="mid">
+            <view class="title">{{ it.skuName }}</view>
+            <text class="qty">×{{ it.quantity }}</text>
+          </view>
+          <ec-price :value="it.price" :size="26" />
+        </view>
+      </view>
+
+      <view class="card">
+        <view class="sec-title">金额明细</view>
+        <view class="row amt"><text>商品金额</text><text>¥{{ fmtMoney(order.amountDetail.goodsAmount) }}</text></view>
+        <view class="row amt"><text>运费</text><text>¥{{ fmtMoney(order.amountDetail.freightAmount) }}</text></view>
+        <view class="row amt"><text>优惠</text><text class="red">-¥{{ fmtMoney(order.amountDetail.discountAmount) }}</text></view>
+        <view class="row amt strong"><text>实付</text><ec-price :value="order.amountDetail.payAmount" :size="32" /></view>
+      </view>
+
+      <view class="card">
+        <view class="sec-title">订单信息</view>
+        <view class="row meta"><text>订单号</text><text class="mono">{{ order.orderNo }}</text></view>
+        <view class="row meta"><text>下单时间</text><text>{{ fmtDateTime(order.createdAt) }}</text></view>
+        <view class="row meta" v-if="order.payTime"><text>支付时间</text><text>{{ fmtDateTime(order.payTime) }}</text></view>
+        <view class="row meta" v-if="order.remark"><text>备注</text><text>{{ order.remark }}</text></view>
+      </view>
+
+      <view class="card" v-if="order.timeline?.length">
+        <view class="sec-title">订单动态</view>
+        <view class="row tl" v-for="(t, i) in order.timeline" :key="i">
+          <view class="tl-mid">
+            <view class="tl-title">{{ t.toStatusText }}</view>
+            <text class="tl-time">{{ fmtDateTime(t.time) }}</text>
+          </view>
+        </view>
+      </view>
+
+      <view class="placeholder"></view>
+
+      <view class="bar row" v-if="order.actions?.length">
+        <view
+          class="op"
+          :class="{ primary: a.type === 'pay' }"
+          v-for="a in order.actions"
+          :key="a.type"
+          @click="onAction(a)"
+        >
+          {{ a.text }}
+        </view>
+      </view>
+    </template>
   </view>
 </template>
 

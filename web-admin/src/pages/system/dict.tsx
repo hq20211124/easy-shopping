@@ -8,6 +8,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Card, Col, Input, Row, Table, Tabs, Typography } from 'antd';
 import { useQuery } from '@tanstack/react-query';
 import { listDictItems, listDictTypes } from '@/api/system';
+import { QueryErrorText } from '@/components/QueryError';
 import { normalizePage } from '@/utils/query';
 
 export default function SystemDict() {
@@ -18,7 +19,7 @@ export default function SystemDict() {
 
   const pageQuery = useMemo(() => ({ ...normalizePage(pageNum, pageSize), keyword }), [pageNum, pageSize, keyword]);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['dict-types', pageQuery],
     queryFn: () => listDictTypes(pageQuery),
     placeholderData: (prev) => prev,
@@ -26,7 +27,13 @@ export default function SystemDict() {
 
   const currentType = activeType || data?.list[0]?.type || '';
 
-  const { data: items, isLoading: itemsLoading } = useQuery({
+  const {
+    data: items,
+    isLoading: itemsLoading,
+    isError: itemsError,
+    error: itemsErrorValue,
+    refetch: refetchItems,
+  } = useQuery({
     queryKey: ['dict-items', currentType],
     queryFn: () => listDictItems(currentType),
     enabled: Boolean(currentType),
@@ -60,6 +67,8 @@ export default function SystemDict() {
             size="small"
             loading={isLoading}
             dataSource={data?.list}
+            // 「加载失败」≠「没有字典类型」：显式错误文案 + 重试入口
+            locale={{ emptyText: isError ? <QueryErrorText error={error} onRetry={() => void refetch()} /> : '暂无字典类型' }}
             onRow={(record) => ({ onClick: () => setActiveType(record.type), style: { cursor: 'pointer' } })}
             columns={[
               { title: '名称', dataIndex: 'name' },
@@ -103,6 +112,13 @@ export default function SystemDict() {
                       loading={itemsLoading}
                       dataSource={items ?? []}
                       pagination={false}
+                      locale={{
+                        emptyText: itemsError ? (
+                          <QueryErrorText error={itemsErrorValue} onRetry={() => void refetchItems()} />
+                        ) : (
+                          '暂无字典项'
+                        ),
+                      }}
                       columns={[
                         { title: '排序', dataIndex: 'sort', width: 80 },
                         { title: '编码', dataIndex: 'code', width: 140 },

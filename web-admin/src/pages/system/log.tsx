@@ -7,6 +7,7 @@ import { useMemo, useState } from 'react';
 import { Card, Col, DatePicker, Descriptions, Drawer, Input, Row, Select, Space, Table, Tag, type TableColumnsType } from 'antd';
 import { useQuery } from '@tanstack/react-query';
 import { listOperationLogs, type OperationLog } from '@/api/system';
+import { QueryErrorText } from '@/components/QueryError';
 import { assertTimeRange, normalizePage } from '@/utils/query';
 import type { Dayjs } from 'dayjs';
 
@@ -32,7 +33,7 @@ export default function SystemLog() {
     };
   }, [pageNum, pageSize, operator, module, range]);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['operation-logs', pageQuery],
     queryFn: () => listOperationLogs(pageQuery),
     placeholderData: (prev) => prev,
@@ -111,6 +112,8 @@ export default function SystemLog() {
           loading={isLoading}
           columns={columns}
           dataSource={data?.list}
+          // 「加载失败」≠「没有日志」：显式错误文案 + 重试入口
+          locale={{ emptyText: isError ? <QueryErrorText error={error} onRetry={() => void refetch()} /> : '暂无操作日志' }}
           scroll={{ x: 1200 }}
           pagination={{
             current: data?.pageNum ?? pageNum,

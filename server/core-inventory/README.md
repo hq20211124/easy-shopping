@@ -46,6 +46,11 @@
 - **幂等**：reserve 以「同 orderId 已有 ACTIVE 预占单」直接返回（下单重试安全）；
   release/deduct 靠预占单状态机 `ACTIVE → RELEASED/DEDUCTED` 单向流转 + `@Version`
   （重复释放等于白送库存，是比重复扣减更危险的一侧，plans 4.4.4 第 4 条）；
+- **逐条独立短事务（P0-E 幽灵锁修复）**：release/deduct 逐条预占单各自一个事务，单条失败
+  （`sku_stock` 记录缺失/乐观锁耗尽/账本漂移）只打 `[inventory-release-failed]` / `[inventory-deduct-failed]`
+  ERROR 告警并继续下一条，**不会把已成功的条目整体回滚**——避免「订单已关单但库存永久卡在 locked」
+  （plans 4.4.4 点名的 v1.0 硬伤）。失败条目保持 ACTIVE，由重试/超时扫描/人工对账兜底；
+  账本锁定量不足预占量时拒绝释放（否则 `locked` 会变负 = 凭空多出可售库存）；
 - **超时释放**：`InventoryExpireScheduler` 每 `app.inventory.expire-scan-ms`（默认 30000）
   扫 `expire_at < now` 且 ACTIVE 的预占单逐条释放，单条失败不阻塞整轮；
   P1 改 RabbitMQ 延迟队列，`deliveryTimestamp` 直取 `pay_deadline`。

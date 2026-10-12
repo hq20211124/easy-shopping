@@ -35,21 +35,26 @@ onShow(async () => {
       const res = await addressApi.list()
       checkout.setAddress(res.addresses.find((a: Address) => a.isDefault) || res.addresses[0] || null)
     } catch (e) {
+      // toast 已由请求层弹出；这里补一条可见提示，避免用户以为"我没设默认地址"
       void e
+      uni.showToast({ title: '默认地址加载失败，请手动选择', icon: 'none' })
     }
   }
-  loadCoupons()
-  runPreview()
+  void loadCoupons()
+  void runPreview()
 })
 
-watch(couponId, () => runPreview())
+watch(couponId, () => void runPreview())
 
 async function loadCoupons() {
   if (!user.token) return
   try {
     coupons.value = await couponApi.my()
   } catch (e) {
+    // toast 已由请求层弹出；券列表为空会让用户以为"没有券"，补一条可见提示
     void e
+    coupons.value = []
+    uni.showToast({ title: '优惠券加载失败', icon: 'none' })
   }
 }
 
@@ -63,10 +68,11 @@ async function runPreview() {
     const res = await couponApi.preview(couponId.value, amounts)
     discount.value = res.eligible ? toCents(res.discount) : 0
   } catch (e) {
-    // 预览接口不可用时降级：不阻断下单，最终以创建订单返回金额为准（C1）
+    // 降级不阻断下单（最终以创建订单返回金额为准，C1），但必须让用户知道"优惠没算上"
     void e
     previewDisabled.value = true
     discount.value = 0
+    uni.showToast({ title: '优惠试算失败，本次按无优惠结算', icon: 'none' })
   }
 }
 
@@ -77,6 +83,8 @@ function chooseAddress() {
 function pickCoupon(id: number | null) {
   checkout.setCoupon(id)
   showCoupons.value = false
+  // 重新选券时复位试算开关，避免一次抖动导致本页后续选券都"静默按无优惠结算"
+  previewDisabled.value = false
 }
 
 async function submit() {

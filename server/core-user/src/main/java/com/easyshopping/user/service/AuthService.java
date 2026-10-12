@@ -92,6 +92,9 @@ public class AuthService {
             throw new BizException(BizErrorCode.PASSWORD_ERROR,
                     user.isLocked() ? "密码错误次数过多，账号已锁定 " + LOCK_MINUTES + " 分钟" : "密码错误");
         }
+        // 校验通过后按需升级密码哈希（P0-H：存量 s256 单轮 SHA-256 → PBKDF2-HMAC-SHA256）。
+        // rehashIfNeeded 对已是新格式且迭代数达标的用户原样返回，不浪费 CPU。
+        user.setPasswordHash(PasswordHasher.rehashIfNeeded(password, user.getPasswordHash()));
         user.recordLoginSuccess();
         loginAudit.recordLoginSuccess(user.getId());
         return user;

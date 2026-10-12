@@ -13,6 +13,7 @@ import { ORDER_REMARK_AVAILABLE, addOrderRemark, closeOrder, listOrders, type Or
 import { ORDER_STATUS_OPTIONS, PAY_TYPE_OPTIONS } from '@/config/constants';
 import { StatusTag } from '@/components/StatusTag';
 import { AuthButton } from '@/components/AuthButton';
+import { QueryErrorText } from '@/components/QueryError';
 import { formatAmount, maskPhone } from '@/utils/format';
 import { normalizePage } from '@/utils/query';
 
@@ -34,7 +35,7 @@ export default function OrderList() {
     [pageNum, pageSize, filters, orderStatus],
   );
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['orders', query],
     queryFn: () => listOrders(query),
     placeholderData: (prev) => prev,
@@ -210,6 +211,8 @@ export default function OrderList() {
         loading={isLoading}
         columns={columns}
         dataSource={data?.list}
+        // 「加载失败」≠「没有订单」：显式错误文案 + 重试入口
+        locale={{ emptyText: isError ? <QueryErrorText error={error} onRetry={() => void refetch()} /> : '暂无订单' }}
         scroll={{ x: 1200 }}
         pagination={{
           current: data?.pageNum ?? pageNum,
