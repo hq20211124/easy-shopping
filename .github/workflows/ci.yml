@@ -1,0 +1,387 @@
+name: CI
+
+# ============================================================================
+# 五终端 CI。核心目的：把「本机 Windows 无法验证的部分」搬到 GitHub 托管 runner 上验证。
+#   - ios-macos：macOS runner 真编译（本仓库 iOS 代码从未被编译器验证过，最大验证缺口）
+#   - backend / frontend-web / miniprogram / android：回归网，防止改一端砸另一端
+# 所有 job 之间无 needs 依赖，完全并行；任一 job 失败不影响其它 job 产出日志/产物。
+# ============================================================================
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      skip_ios:
+        description: '跳过 iOS job（macOS 额度紧张时用；iOS 是首次验证缺口，建议别长期跳过）'
+        type: boolean
+        default: false
+
+# 最小权限：所有 job 只读代码仓，不写、不发评论、不动 secrets
+permissions:
+  contents: read
+
+# 并发控制：PR 上新的 push 取消旧 run（省 macOS 额度）；
+# master/main 与手动触发不取消——首次 iOS 验证很贵，绝不能被后来的 push 掐断。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ==========================================================================
+  # 1. 后端：server/ 13 个 Maven 模块，JDK 17
+  # ==========================================================================
+  backend:
+    name: backend (mvn test + package)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: server
+    env:
+      # JDK 17 在 Linux 上默认跟随 locale（可能退化成 ASCII），
+      # 显式钉 UTF-8 防止中文注释/日志乱码——这是 Windows GBK 坑在 Linux 上的等价物。
+      MAVEN_OPTS: '-Dfile.encoding=UTF-8 -Xmx2g'
+    steps:
+      - uses: actions/checkout@v4
+
+      # setup-java 自带 maven 缓存，key 由 cache-dependency-path（全部 pom.xml）哈希得出
+      - name: 准备 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: server/**/pom.xml
+      # 仓库没有 Maven wrapper（mvnw 不入库），直接用 ubuntu runner 预装的 Maven 3.9.x；
+      # 与本机「必须用全路径 mvn.cmd」的约定（DEV.md §1）无关——那是 Windows PATH 问题。
+
+      - name: 可选：配置 Maven 镜像
+        # GitHub 托管 runner 在美国机房，直连 Maven Central 正常，默认不配镜像。
+        # 若需走阿里云加速（国内自建 runner / 网络受限时），
+        # 在仓库 Settings → Secrets and variables → Actions → Variables 新增
+        #   MAVEN_MIRROR_URL = https://maven.aliyun.com/repository/public
+        # 即可，无需改本文件。
+        if: ${{ vars.MAVEN_MIRROR_URL != '' }}
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">
+            <mirrors>
+              <mirror>
+                <id>aliyun-public</id>
+                <mirrorOf>central</mirrorOf>
+                <url>${{ vars.MAVEN_MIRROR_URL }}</url>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+
+      # -B(batch) -ntp(不刷传输进度) 而不是 -q：-q 会把模块级 INFO 一起吞掉，
+      # 出错时看不出「挂在哪个模块」，CI 上可读性优先。
+      - name: 全量单测
+        run: mvn -B -ntp test
+
+      - name: 打包（跳过测试）
+        run: mvn -B -ntp -DskipTests package
+
+      - name: 上传可执行 jar
+        # common 是普通 jar，其余 *-0.1.0-SNAPSHOT.jar 即各服务启动包（DEV.md §2）
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-jars
+          path: server/**/target/*.jar
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 上传 Surefire 测试报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-surefire-reports
+          path: server/**/target/surefire-reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ==========================================================================
+  # 2. Web 端：web-admin / web-buyer 并行（同一套 React+Vite 工具链，只是依赖不同）
+  # ==========================================================================
+  frontend-web:
+    name: frontend-web (${{ matrix.app }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      # 任何一个端挂掉都要看到另一个端的结果，所以不 fail-fast
+      fail-fast: false
+      matrix:
+        app: [web-admin, web-buyer]
+    defaults:
+      run:
+        working-directory: ${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 必须先装 pnpm 再 setup-node：setup-node 的 cache:'pnpm' 依赖 PATH 上已有 pnpm
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # 与本机一致（pnpm 12 用 pnpm-workspace.yaml 的 allowBuilds 字段放行 esbuild 构建脚本，
+          # pnpm 11 及更早不认该字段名，会导致 esbuild postinstall 被拦 → vite 构建失败）
+          version: 12.6.0
+
+      - name: 准备 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: ${{ matrix.app }}/pnpm-lock.yaml
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建（tsc -b && vite build）
+        run: pnpm build
+
+      - name: ESLint
+        run: pnpm lint
+
+      - name: 单测（vitest run）
+        run: pnpm test
+
+      - name: 上传 dist 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.app }}-dist
+          path: ${{ matrix.app }}/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  # ==========================================================================
+  # 3. 小程序：uni-app，H5 与微信小程序双构建
+  # ==========================================================================
+  miniprogram:
+    name: miniprogram (type-check + h5 + mp-weixin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: miniprogram
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # 同 frontend-web：本仓 lockfile 由 pnpm 12 生成，且 .npmrc / pnpm-workspace.yaml
+          # 用了 pnpm 12 的 strict-peer-dependencies / allowBuilds 新字段
+          version: 12.6.0
+
+      - name: 准备 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: miniprogram/pnpm-lock.yaml
+
+      # 这里用普通 install 而非 --frozen-lockfile：uni-app 的 peer 依赖树很脆，
+      # 本 job 的目的是验证「能编译出 H5 + mp-weixin 两份产物」，不是充当 lockfile 门禁；
+      # 若哪天 lockfile 与 package.json 不同步，--frozen-lockfile 会让 CI 因无关原因红。
+      - name: 安装依赖
+        run: pnpm install
+
+      - name: 类型检查（vue-tsc）
+        run: pnpm type-check
+
+      - name: 构建 H5
+        run: pnpm build:h5
+
+      - name: 构建微信小程序
+        run: pnpm build:mp-weixin
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: miniprogram-dist
+          path: miniprogram/dist/build
+          if-no-files-found: error
+          retention-days: 7
+
+  # ==========================================================================
+  # 4. Android：Kotlin + Compose，assembleDebug
+  # ==========================================================================
+  android:
+    name: android (assembleDebug)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    defaults:
+      run:
+        working-directory: android-client
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 仓库没有 gradle wrapper（gradlew / gradle/wrapper 未入库），
+      # 因此必须由 setup-gradle 显式装版本：README 要求 Gradle 8.4+（AGP 8.2.2 下限 8.2），
+      # 8.4 正是本机验证过的版本，锁死它避免 Gradle 大版本升级带来的无谓差异。
+      # 该 action 同时开启 ~/.gradle 缓存（key 自带 build 脚本哈希）。
+      - name: 准备 Gradle 8.4
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.4'
+
+      - name: 准备 Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 SDK 平台与构建工具
+        # compileSdk / buildToolsVersion 取自 app/build.gradle.kts（34 / 34.0.0）
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: 写入 local.properties
+        # local.properties 被 .gitignore 忽略（不入库），CI 必须用 ANDROID_HOME 现写；
+        # baseUrl 不写则走 app/build.gradle.kts 的缺省值 http://10.0.2.2:8080/（编译期无影响）
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          echo "baseUrl=http://10.0.2.2:8080/" >> local.properties
+
+      - name: 编译 debug APK
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug.apk
+          path: android-client/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  # ==========================================================================
+  # 5. iOS（本 CI 的核心目的）
+  #    仓库 .xcodeproj 不入库 → 必须先 xcodegen generate 再 xcodebuild。
+  #    ⚠️ 首次运行大概率失败：iOS 代码从未被 Xcode 编译过（本机 Windows 无 Xcode）。
+  #       失败是预期结果，本 job 的价值就是把真实编译错误抓出来，详见 .github/README.md。
+  # ==========================================================================
+  ios-macos:
+    name: ios-macos (xcodebuild)
+    if: ${{ !inputs.skip_ios }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 XcodeGen
+        # .xcodeproj 由 project.yml 生成且已 gitignore，CI 必须现装现生成
+        run: brew install xcodegen
+
+      - name: 生成 Xcode 工程
+        working-directory: ios-client
+        run: |
+          xcodegen --version
+          xcodegen generate --spec project.yml
+
+      - name: 列出工程 target / scheme（排查 scheme 名是否对得上）
+        working-directory: ios-client
+        # project.yml 里 name=EasyShopping、target=EasyShopping、scheme 显式声明，
+        # 所以 scheme 名与 project 名都应是 EasyShopping；这里打出来便于对不上时一眼定位
+        run: xcodebuild -list -project EasyShopping.xcodeproj
+
+      - name: 缓存 DerivedData
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/DerivedData
+          # key 含全部 Swift 源码 + project.yml 的哈希：任一源码/工程规格改动即失效
+          key: ios-deriveddata-${{ hashFiles('ios-client/**/*.swift', 'ios-client/project.yml') }}
+          restore-keys: |
+            ios-deriveddata-
+
+      - name: 编译（xcodebuild）
+        id: xcodebuild
+        # continue-on-error：让后面的「上传日志 / 写错误摘要」在失败时也一定执行（if: always()）
+        # 最终成败由最后一步按 outcome 判定
+        continue-on-error: true
+        working-directory: ios-client
+        run: |
+          set -o pipefail   # 不加这句，管道会取 tee 的退出码，xcodebuild 失败会被吞掉
+          xcodebuild \
+            -project EasyShopping.xcodeproj \
+            -scheme EasyShopping \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -resultBundlePath "$RUNNER_TEMP/EasyShopping.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+        # 说明：
+        #  · 不接 xcpretty —— 它会把原始 `文件:行:列: error: 描述` 行重排/截断，
+        #    反而破坏「抓前 50 条 error」这个目的；原始日志 + tee 才是最佳可诊断格式。
+        #  · generic/platform=iOS Simulator —— 不挑具体机型/系统版本，
+        #    免去模拟器 runtime 版本漂移与启动失败，CI 只验「能不能编译过」。
+
+      - name: 上传完整构建日志与 xcresult
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-log
+          path: |
+            ${{ runner.temp }}/xcodebuild.log
+            ${{ runner.temp }}/EasyShopping.xcresult
+          if-no-files-found: warn
+          retention-days: 30   # macOS 额度稀缺，失败现场留久一点
+
+      - name: 汇总编译错误到 Job Summary
+        if: always()
+        run: |
+          LOG="$RUNNER_TEMP/xcodebuild.log"
+          {
+            echo "## iOS 编译结果（EasyShopping / iOS 16.0 / Swift 5 模式）"
+            echo
+            if [ "${{ steps.xcodebuild.outcome }}" != "failure" ]; then
+              echo "✅ xcodebuild 通过（scheme `EasyShopping`，destination `generic/platform=iOS Simulator`）"
+              echo
+            else
+              echo "❌ xcodebuild 失败"
+              echo
+              echo "> **首次失败属于预期结果**：iOS 客户端此前从未被 Xcode 编译过（本项目在 Windows 开发）。"
+              echo "> 处理方式见 \`.github/README.md\` 的「iOS 首次运行预期」。"
+              echo
+              if [ -f "$LOG" ]; then
+                # grep -c 无匹配时打印 0 但退出码 1，必须 || true 兜住（shell 默认 -e）
+                TOTAL=$(grep -c "error:" "$LOG" || true)
+                echo "错误行总数：**${TOTAL:-0}**（下方最多列出 50 条）"
+                echo
+                echo "<details><summary>前 50 条 <code>error:</code> 行</summary>"
+                echo
+                echo '```'
+                # 先捕获再判空：`grep ... | head -50 || echo` 的兜底分支永远不会触发（管道退出码取自 head）
+                ERRORS=$(grep -n "error:" "$LOG" | head -50 || true)
+                if [ -n "$ERRORS" ]; then
+                  echo "$ERRORS"
+                else
+                  echo "（日志中没有 error: 行——失败可能发生在 xcodegen / 工程加载 / 签名阶段，请直接看完整日志）"
+                fi
+                echo '```'
+                echo
+                echo "</details>"
+              else
+                echo "未生成 xcodebuild.log：失败发生在更早的环节（xcodegen / brew / checkout），请看上方步骤日志。"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 按编译结果判定成败
+        if: steps.xcodebuild.outcome == 'failure'
+        run: |
+          echo "xcodebuild 失败，完整日志见 artifact：ios-build-log"
+          exit 1
