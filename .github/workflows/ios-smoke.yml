@@ -289,10 +289,19 @@ jobs:
           EXECUTABLE_NAME="$(setting EXECUTABLE_NAME)"
 
           APP_PATH=""
-          if [ -n "$TARGET_BUILD_DIR" ] && [ -n "$WRAPPER_NAME" ] && [ -d "$TARGET_BUILD_DIR/$WRAPPER_NAME.app" ]; then
-            APP_PATH="$TARGET_BUILD_DIR/$WRAPPER_NAME.app"
-          else
-            APP_PATH="$(find "$RUNNER_TEMP/DerivedData/Build/Products" -maxdepth 2 -name '*.app' -type d 2>/dev/null | head -1 || true)"
+          # ⚠️ WRAPPER_NAME 本身已带 .app（实测值：EasyShopping.app），不要再拼一次扩展名。
+          #    拼错会退化成 EasyShopping.app.app，静默找不到产物 → 后续步骤连锁 unbound 变量。
+          if [ -n "$TARGET_BUILD_DIR" ] && [ -n "$WRAPPER_NAME" ]; then
+            for cand in "$TARGET_BUILD_DIR/$WRAPPER_NAME" "$TARGET_BUILD_DIR/$WRAPPER_NAME.app"; do
+              if [ -d "$cand" ]; then APP_PATH="$cand"; break; fi
+            done
+          fi
+          if [ -z "$APP_PATH" ]; then
+            # 兜底再兜底：DerivedData 层级随 Xcode 版本变化，-maxdepth 放宽到 4
+            APP_PATH="$(find "$RUNNER_TEMP/DerivedData" -maxdepth 4 -name '*.app' -type d 2>/dev/null | head -1 || true)"
+            if [ -n "$APP_PATH" ]; then
+              echo "::warning::主路径未命中，改用 find 兜底：$APP_PATH"
+            fi
           fi
 
           # bundle id 的真值来源是 project.yml（不硬编码）；
@@ -306,6 +315,15 @@ jobs:
           # 以**产物**里的标识为准去 launch（simctl 只认装进去的那个 bundle），
           # spec 值只用来发现漂移并给出警告。
           BUNDLE_ID="${BUILT_BUNDLE_ID:-$SPEC_BUNDLE_ID}"
+          # app.env 无论成败都先写一份（含空值）——否则后续步骤在 set -u 下引用
+          # $BUNDLE_ID/$APP_PATH 会直接 unbound variable，把现场收集也一起带崩。
+          {
+            echo "APP_PATH=\"$APP_PATH\""
+            echo "BUNDLE_ID=\"$BUNDLE_ID\""
+            echo "SPEC_BUNDLE_ID=\"$SPEC_BUNDLE_ID\""
+            echo "BUILT_BUNDLE_ID=\"$BUILT_BUNDLE_ID\""
+            echo "EXECUTABLE_NAME=\"${EXECUTABLE_NAME:-}\""
+          } > "$WORK/state/app.env"
           if [ -z "$BUNDLE_ID" ]; then
             echo "::error::无法确定 bundle id（project.yml 与产物 Info.plist 都没取到）"
             echo 0 > "$WORK/state/app.ok"
