@@ -111,7 +111,7 @@ for (const [skuId, want, label] of [[skuA, 5, 'A'], [skuB, 0, 'B']]) {
 const mobile = `139${uid}${String(stamp % 10000).padStart(4, '0')}`.slice(0, 11);
 const buyerPass = 'Buyer#12345';
 
-const reg = await expect('买家注册', 'POST', '/api/v1/auth/register', 0, {
+await expect('买家注册', 'POST', '/api/v1/auth/register', 0, {
   body: { mobile, code: '123456', password: buyerPass },
   idem: `reg-${uid}`,
 });

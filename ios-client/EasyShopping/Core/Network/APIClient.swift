@@ -115,6 +115,12 @@ final class APIClient {
     /// Access Token：只在内存，进程重启后由 refresh 恢复。
     private(set) var accessToken: String?
 
+    /// UserDefaults 键名集中定义（避免魔法字符串散落；P1 迁 Keychain 时只改这一处）。
+    /// 由 GitHub Actions macOS runner 首次编译验证补回——`@MainActor` 重构时遗漏了本定义。
+    private enum TokenKeys {
+        static let refreshToken = "es.refreshToken"
+    }
+
     /// Refresh Token：持久化（P0 用 UserDefaults，P1 应迁 Keychain，见 plans/ios-frontend 3.2）。
     var storedRefreshToken: String? {
         get { UserDefaults.standard.string(forKey: TokenKeys.refreshToken) }
