@@ -30,13 +30,26 @@
   HTTP 409 + code 1005（core-order OrderIdempotencyTest 已固化该行为），
   所以第 9 步断言「不产生第二单，且返回 409/1005（或同单）」。
 
+  跨平台：同一份脚本既在 Windows PowerShell 5.1（本机）也在 PowerShell 7（Linux /
+    GitHub Actions ubuntu runner）跑。两者的关键差异是「非 2xx 响应体怎么拿」——
+      PS 5.1：$_.Exception.Response 是 System.Net.HttpWebResponse，可 GetResponseStream()
+      PS 7  ：$_.Exception.Response 是 System.Net.Http.HttpResponseMessage，没有该方法，
+              但 $_.ErrorDetails.Message 里就是响应体文本
+    第 10 步（3002）、第 13 步（1002）等断言全部依赖响应体，Get-ResponseText 的三分支取法
+    保证两种宿主取到同一份 JSON。**断言本身未做任何增删。**
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File server\scripts\smoke.ps1
+  pwsh -File server/scripts/smoke.ps1      # Linux / CI
 #>
 [CmdletBinding()]
 param()
 
 $ErrorActionPreference = 'Stop'
+
+# 跨平台公共库（smoke 只用到控制台编码部分）
+. (Join-Path $PSScriptRoot 'platform-lib.ps1')
+Initialize-ConsoleEncoding
 
 $GW     = 'http://127.0.0.1:8080'
 $DIRECT_USER = 'http://127.0.0.1:8081'
@@ -53,6 +66,41 @@ $script:Fail = 0
 
 # ------------------------------------------------------------------ 基础设施
 
+<#
+  从 Invoke-WebRequest 抛出的错误记录里取出「非 2xx 响应体」原文。
+  第 10/13 步断言 code=3002 / 1002 完全依赖这个函数，故必须对 PS 5.1 与 PS 7 都成立。
+  三级回退：ErrorDetails（PS 7 最省事）→ HttpResponseMessage.Content（PS 7）
+          → HttpWebResponse.GetResponseStream（PS 5.1）。
+#>
+function Get-ResponseText {
+    param($ErrorRecord)
+    try {
+        if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+            return [string]$ErrorRecord.ErrorDetails.Message
+        }
+    } catch { }
+    $errResp = $null
+    try { $errResp = $ErrorRecord.Exception.Response } catch { }
+    if (-not $errResp) { return '' }
+    try {
+        # PS 7：HttpResponseMessage
+        if ($errResp.PSObject.Properties['Content'] -and $errResp.Content) {
+            $t = $errResp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            if ($t) { return [string]$t }
+        }
+    } catch { }
+    try {
+        # PS 5.1：HttpWebResponse
+        $stream = $errResp.GetResponseStream()
+        # PS 5.1 抛错前可能已把流读到末尾，不回卷就读出空串
+        if ($stream -and $stream.CanSeek) { $stream.Position = 0 }
+        $sr = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+        $out = $sr.ReadToEnd()
+        $sr.Close()
+        return [string]$out
+    } catch { return '' }
+}
+
 function Invoke-Api {
     [CmdletBinding()]
     param(
@@ -68,8 +116,10 @@ function Invoke-Api {
         Method         = $Method
         UseBasicParsing = $true
         TimeoutSec     = $TimeoutSec
-        Headers        = $Headers
     }
+    # 空 hashtable 与「不传 Headers」语义完全相同（无请求头），但 PowerShell 7 对空 Headers
+    # 的参数校验比 5.1 严，传下去可能直接抛错。省略参数即可，断言结果不受影响。
+    if ($Headers -and $Headers.Count -gt 0) { $params.Headers = $Headers }
     if ($Json -ne '') {
         $params.Body = [System.Text.Encoding]::UTF8.GetBytes($Json)
         $params.ContentType = 'application/json; charset=utf-8'
@@ -82,14 +132,7 @@ function Invoke-Api {
         $errResp = $_.Exception.Response
         if ($errResp) {
             $res.status = [int]$errResp.StatusCode
-            try {
-                $stream = $errResp.GetResponseStream()
-                # PS 5.1 抛错前可能已把流读到末尾，不回卷就读出空串
-                if ($stream -and $stream.CanSeek) { $stream.Position = 0 }
-                $sr = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
-                $res.text = $sr.ReadToEnd()
-                $sr.Close()
-            } catch { $res.text = '' }
+            $res.text = Get-ResponseText -ErrorRecord $_
         } else {
             $res.status = -1
             $res.error = $_.Exception.Message

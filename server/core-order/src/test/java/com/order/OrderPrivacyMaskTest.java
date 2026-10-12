@@ -21,6 +21,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 接口输出统一按 12.5 规则脱敏」；12.6 隐私原则 2「接口返回遵循最小化原则」；
  * admin-backend 4.4.3「敏感列脱敏后再写文件」。plans 未对订单 owner 开明文例外，
  * 故买家端详情同样按脱敏处理（保守口径）。</p>
+ *
+ * <p><b>落库已改为 AES-256-GCM 密文（P1 审计登记项）</b>，但脱敏口径一字未改：
+ * 出参先解密、再按 12.5 脱敏；密文相关的断言在 {@code ReceiverMobileCryptoTest}。</p>
  */
 @SpringBootTest(properties = {
         "spring.datasource.url=jdbc:h2:mem:core-order-mask-test;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE",
@@ -66,8 +69,20 @@ class OrderPrivacyMaskTest extends AbstractOrderTest {
         assertThat(queryService.adminDetail(order.orderId()).receiverMobile()).isEqualTo(MASKED);
     }
 
+    /**
+     * 脱敏只发生在出参，实体侧看到的是<b>解密后</b>的明文。
+     *
+     * <p><b>用例意图在 P1 加密落地后做了等价改写</b>：原名「脱敏只发生在出参_落库仍为明文供P1加密链路改造」，
+     * 断言本身（实体取到 {@code 13800000000}）一字未动，只是「落库仍为明文」这个前提已不成立——
+     * 落库改为 AES-256-GCM 密文，加解密发生在 {@code ReceiverMobileConverter}（持久化边界），
+     * 故实体内存里仍是明文。改为断言「实体读到的是解密后明文」，意图与原用例完全一致：
+     * <b>脱敏发生在出参，不发生在领域对象上</b>。</p>
+     *
+     * <p>「列里确实是密文」由 {@code ReceiverMobileCryptoTest#下单落库为密文_列内不含明文} 用
+     * JDBC 直读列断言（本类无 JdbcTemplate，不在此重复）。</p>
+     */
     @Test
-    void 脱敏只发生在出参_落库仍为明文供P1加密链路改造() {
+    void 脱敏只发生在出参_实体侧读到的是解密后明文() {
         CreateOrderResponse order = createOne();
 
         assertThat(orderMainRepository.findById(order.orderId()).orElseThrow().getReceiverMobile())

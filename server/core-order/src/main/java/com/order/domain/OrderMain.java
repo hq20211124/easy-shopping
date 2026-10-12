@@ -1,6 +1,8 @@
 package com.order.domain;
 
+import com.order.crypto.ReceiverMobileConverter;
 import jakarta.persistence.Column;
+import jakarta.persistence.Convert;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.Index;
@@ -103,11 +105,23 @@ public class OrderMain {
     @Column(name = "coupon_id")
     private Long couponId;
 
-    // ---- 收货地址快照（下单时固化，后续改地址不影响历史订单；P1 落库加密 + 输出脱敏）----
+    // ---- 收货地址快照（下单时固化，后续改地址不影响历史订单；手机号落库 AES-256-GCM 密文 + 输出脱敏）----
     @Column(name = "receiver_name", length = 64)
     private String receiverName = "";
 
-    @Column(name = "receiver_mobile", length = 20)
+    /**
+     * 收货人手机号（<b>落库为 AES-256-GCM 密文</b>，审计 P1 登记项落地）。
+     *
+     * <p><b>列里是密文、实体里是明文</b>：加解密由 {@link com.order.crypto.ReceiverMobileConverter}
+     * 在持久化边界完成，因此本类到 Service/出参链路拿到的永远是明文（脱敏口径不变）。
+     * 密文格式 {@code v1:keyId:iv_b64:ct_b64}，随机 IV 每次不同，历史明文行无前缀按明文直出。</p>
+     *
+     * <p><b>列宽 20 → 255</b>：11 位手机号明文加密后约 65 字符，255 是 H2 与 MySQL 通用取值。
+     * 存量 varchar(20) 的库（H2 {@code ddl-auto=update} 不会改已有列定义）需先扩列，
+     * SQL 见模块 README「11. 收货人手机号落库加密」；启动期列宽巡检会打 ERROR 提示。</p>
+     */
+    @Column(name = "receiver_mobile", length = 255)
+    @Convert(converter = ReceiverMobileConverter.class)
     private String receiverMobile = "";
 
     @Column(name = "receiver_address", length = 512)

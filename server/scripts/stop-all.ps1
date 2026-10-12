@@ -8,13 +8,21 @@
   3) 最后校验各业务端口是否已释放（[::1] 上 WSL wslrelay 的监听不属于我们，忽略）。
   绝不按"端口 = 8081"这种条件杀进程，避免误杀 WSL relay 等非本项目进程。
 
+  跨平台：进程命令行查询 Windows 走 Get-CimInstance，Linux 走 /proc/<pid>/cmdline；
+  端口复核 Windows 走 Get-NetTCPConnection，Linux 走 /proc/net/tcp{,6}。详见 platform-lib.ps1。
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File server\scripts\stop-all.ps1
+  pwsh -File server/scripts/stop-all.ps1      # Linux / CI
 #>
 [CmdletBinding()]
 param()
 
 $ErrorActionPreference = 'Stop'
+
+# 跨平台公共库：平台判定 / 监听端口查询 / 控制台编码（Windows 侧行为保持原样）
+. (Join-Path $PSScriptRoot 'platform-lib.ps1')
+Initialize-ConsoleEncoding
 
 $ServerRoot = Split-Path -Parent $PSScriptRoot
 $Logs = Join-Path $ServerRoot 'logs'
@@ -51,13 +59,7 @@ foreach ($n in $Names) {
 # 标记 = start-all.ps1 注入的 --server.address=127.0.0.1；缺一不可，
 # 避免误杀同目录下其它代理/同事手工拉起的实例（如 --server.port=18081 的调试进程）。
 $marker = '--server.address=127.0.0.1'
-$orphan = @()
-try {
-    $orphan = @(Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction Stop |
-        Where-Object { ($_.CommandLine -like ("*" + $ServerRoot + "*")) -and ($_.CommandLine -like ("*" + $marker + "*")) })
-} catch {
-    # Get-CimInstance 不可用时忽略，pid 文件那步已经覆盖主要场景
-}
+$orphan = @(Get-JavaCommandLine -MustContainPath $ServerRoot -MustContainMarker $marker)
 foreach ($p in $orphan) {
     if ($p.ProcessId) {
         Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
@@ -76,12 +78,13 @@ if ($stopped -eq 0) {
 # ---- 3. 端口复核 ----
 $busy = @()
 foreach ($port in $Ports) {
-    $conns = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
-    foreach ($c in @($conns)) {
+    foreach ($c in @(Get-ListeningSocket -Port $port)) {
         if ($c.LocalAddress -eq '::1') { continue }   # WSL relay，非本项目
-        $owner = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
+        $owner = $null
+        if ($null -ne $c.OwningProcess) { $owner = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue }
         $ownerName = if ($owner) { $owner.ProcessName } else { '?' }
-        $busy += ("{0}({1}:{2})" -f $port, $ownerName, $c.OwningProcess)
+        $ownerPid = if ($null -eq $c.OwningProcess) { '?' } else { $c.OwningProcess }
+        $busy += ("{0}({1}:{2})" -f $port, $ownerName, $ownerPid)
     }
 }
 if ($busy.Count -gt 0) {

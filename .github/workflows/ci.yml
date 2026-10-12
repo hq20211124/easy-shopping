@@ -3,8 +3,10 @@ name: CI
 # ============================================================================
 # 五终端 CI。核心目的：把「本机 Windows 无法验证的部分」搬到 GitHub 托管 runner 上验证。
 #   - ios-macos：macOS runner 真编译（本仓库 iOS 代码从未被编译器验证过，最大验证缺口）
+#   - e2e-smoke：ubuntu runner 真起 11 个后端服务跑 13 步跨服务契约冒烟
 #   - backend / frontend-web / miniprogram / android：回归网，防止改一端砸另一端
-# 所有 job 之间无 needs 依赖，完全并行；任一 job 失败不影响其它 job 产出日志/产物。
+# 前 5 个 job 之间无 needs 依赖，完全并行；e2e-smoke 是唯一有依赖的（needs: backend，
+# 因为它要消费 backend 打出来的 jar）。任一 job 失败不影响其它 job 产出日志/产物。
 # ============================================================================
 
 on:
@@ -15,6 +17,10 @@ on:
     inputs:
       skip_ios:
         description: '跳过 iOS job（macOS 额度紧张时用；iOS 是首次验证缺口，建议别长期跳过）'
+        type: boolean
+        default: false
+      skip_e2e:
+        description: '跳过 e2e-smoke job（省 Linux 分钟；跨服务契约网，建议别长期跳过）'
         type: boolean
         default: false
 
@@ -394,3 +400,203 @@ jobs:
         run: |
           echo "xcodebuild 失败，完整日志见 artifact：ios-build-log"
           exit 1
+
+  # ==========================================================================
+  # 6. e2e-smoke：真实起 11 个后端服务，跑通完整购物链路
+  #
+  # 为什么需要它（这是本 job 存在的唯一理由，不要为了"让 CI 变绿"削弱它）：
+  #   AUDIT 查出的两个资金级 P0 —— prepay 取了 totalAmount 而不是订单快照的 payAmount、
+  #   refund 是空实现 —— **都发生在被 @MockBean 掉的跨服务边界上**。
+  #   `mvn test` 全绿，但契约是错的。单元测试验证的是"模块内"，验证不了"模块间"。
+  #   server/scripts/smoke.ps1 早已能在本机跑通 13 步 32 断言，但一直只在本机跑，
+  #   也就是说"跨服务契约"至今没有任何自动化保护。本 job 把它变成每次 push 都验证的东西。
+  #
+  # 用 pwsh 而不是 bash 重写一套：smoke.ps1 里的 32 条断言（浮点比较 Eq、券的 UTC 时间
+  # 拼装、下单 payload 拼串、响应信封取值）是唯一实现。复制成 bash 等于制造第二份会漂移的
+  # 契约校验；ubuntu-latest 自带 PowerShell 7，直接跑同一份脚本是最强保证。
+  # ==========================================================================
+  e2e-smoke:
+    name: e2e-smoke (11 services + 13-step contract smoke)
+    if: ${{ !inputs.skip_e2e }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # 唯一有 needs 的 job：必须等 backend 打完 jar（backend 失败则本 job 自动跳过）
+    needs: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 JDK 17
+        # 不用 setup-java 的 maven 缓存：这里不跑 mvn，只 java -jar 启服务
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 取出 backend job 的 jar
+        # backend 上传的是 server/**/target/*.jar，upload-artifact 以「所有命中文件的最小公共
+        # 祖先」为根，即 server/ —— 所以下载到 path: server 后正好还原成
+        #   server/<module>/target/<module>-0.1.0-SNAPSHOT.jar
+        # 正是 start-all.ps1 期望的布局（它按 server/<svc>/target/ 找 jar）。
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-jars
+          path: server
+
+      - name: 校验 jar 还原结果 + 打印工具链版本
+        working-directory: server
+        run: |
+          set -euo pipefail
+          java -version 2>&1
+          pwsh --version
+          echo '--- 还原到的 jar ---'
+          # 用 || true：glob 没命中时 ls 退出码非 0，交给下面循环给出「缺哪个模块」的可读提示
+          ls -1 */target/*.jar || echo '(一个 jar 都没还原出来)'
+          missing=0
+          for m in core-user core-product core-price core-inventory core-cart core-order \
+                   core-payment core-promotion core-search admin-bff gateway; do
+            if [ ! -f "$m/target/$m-0.1.0-SNAPSHOT.jar" ]; then
+              echo "::error::缺少 $m/target/$m-0.1.0-SNAPSHOT.jar"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: 起服务（11 个 JVM 并发冷启动，就绪上限 600s）
+        id: start
+        working-directory: server
+        # continue-on-error：起服务失败也要走后面的「上传日志 / Job Summary」，否则最需要日志的时候没日志
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          # 用 -Command 而不是 -File：GitHub 的 `shell: pwsh` 是**点加载**临时脚本，
+          # 点加载不会传参，-ReadyTimeoutSec / -JvmArgs 会被静默丢弃。
+          pwsh -NoProfile -Command "& './scripts/start-all.ps1' -ReadyTimeoutSec 600 -JvmArgs @('-Xmx448m','-Xms96m','-XX:MaxMetaspaceSize=192m','-XX:+UseSerialGC','-Xss512k')" \
+            2>&1 | tee logs/start-ci.txt
+
+      - name: 跑端到端冒烟（13 步 32 断言，全走网关 :8080）
+        id: smoke
+        working-directory: server
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          # smoke.ps1 零参数，-File 即可；set -o pipefail 保证 tee 不吞掉 pwsh 的非 0 退出码
+          pwsh -NoProfile -File ./scripts/smoke.ps1 2>&1 | tee logs/smoke-ci.txt
+
+      - name: 停服务（无论成败）
+        if: always()
+        working-directory: server
+        run: |
+          pwsh -NoProfile -File ./scripts/stop-all.ps1 || true
+          # 兜底：pid 文件在 runner 被强杀/脚本提前退出时可能不完整，
+          # ubuntu runner 是一次性的，直接把所有本 job 拉起的 java 收干净。
+          pkill -f 'java -jar' || true
+          sleep 2
+          pkill -9 -f 'java -jar' || true
+          echo '清理完成'
+
+      - name: 上传服务日志与冒烟输出
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-service-logs
+          path: |
+            server/logs/*.log
+            server/logs/smoke-ci.txt
+            server/logs/start-ci.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 汇总结果到 Job Summary
+        if: always()
+        run: |
+          SMOKE="server/logs/smoke-ci.txt"
+          START="server/logs/start-ci.txt"
+          {
+            echo "## e2e-smoke：11 服务 + 13 步跨服务契约冒烟"
+            echo
+            if [ "${{ steps.start.outcome }}" = "success" ] && [ "${{ steps.smoke.outcome }}" = "success" ]; then
+              echo "✅ 11 个服务就绪，13 步 / 32 断言全绿（全部经网关 \`http://127.0.0.1:8080\`）"
+              echo
+            else
+              # 注意：GitHub 的 run 块是 bash -e，`[ ... ] && echo` 在条件为假时整体返回 1
+              # 会直接把步骤判失败（Summary 写一半就没了），所以一律用 if/fi。
+              if [ "${{ steps.start.outcome }}" != "success" ]; then
+                echo "❌ **服务未全部就绪**（start-all.ps1 退出码非 0）"
+              fi
+              if [ "${{ steps.smoke.outcome }}" != "success" ]; then
+                echo "❌ **冒烟未全绿**（smoke.ps1 退出码非 0）"
+              fi
+              echo
+            fi
+
+            if [ -f "$SMOKE" ]; then
+              TOTAL=$(grep -c '^  \[PASS\]' "$SMOKE" || true)
+              FAILED=$(grep -c '^  \[FAIL\]' "$SMOKE" || true)
+              echo "断言统计：**通过 ${TOTAL:-0} / 失败 ${FAILED:-0}**"
+              echo
+              if [ "${FAILED:-0}" -gt 0 ]; then
+                echo "<details open><summary>失败的断言</summary>"
+                echo
+                echo '```'
+                grep -n '^  \[FAIL\]' "$SMOKE" || true
+                echo '```'
+                echo
+                echo "</details>"
+                echo
+              fi
+              # 服务没起来时冒烟会在第 0 步就退（exit 2），断言列表是空的，
+              # 这时把前置检查的输出翻出来才看得出是网关没就绪还是别的
+              if [ "${FAILED:-0}" -eq 0 ] && [ "${{ steps.smoke.outcome }}" != "success" ]; then
+                echo "<details open><summary>冒烟输出（无失败断言，多半是前置检查没过）</summary>"
+                echo
+                echo '```'
+                head -40 "$SMOKE" || true
+                echo '```'
+                echo
+                echo "</details>"
+                echo
+              fi
+            else
+              echo "未生成 \`smoke-ci.txt\`：失败发生在更早的环节（jar 还原 / 服务就绪），请看上方步骤日志与 artifact \`e2e-service-logs\`。"
+              echo
+            fi
+
+            if [ "${{ steps.start.outcome }}" != "success" ] && [ -f "$START" ]; then
+              echo "<details><summary>启动失败上下文（start-all.ps1 末尾 60 行）</summary>"
+              echo
+              echo '```'
+              tail -60 "$START" || true
+              echo '```'
+              echo
+              echo "</details>"
+              echo
+            fi
+
+            # 各服务日志里的 ERROR 行：定位是哪个服务先炸的
+            ERRS=$(grep -rn --include='*.log' -E '^\s*[0-9-]+ [0-9:.]+\s+ERROR|APPLICATION FAILED TO START' server/logs 2>/dev/null | head -25 || true)
+            if [ -n "$ERRS" ]; then
+              echo "<details><summary>服务日志中的 ERROR（最多 25 条）</summary>"
+              echo
+              echo '```'
+              echo "$ERRS"
+              echo '```'
+              echo
+              echo "</details>"
+              echo
+            fi
+            echo "> 完整日志见 artifact \`e2e-service-logs\`（含 \`server/logs/<svc>.log\` 与 \`.err.log\`）。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 按结果判定成败
+        run: |
+          rc=0
+          if [ "${{ steps.start.outcome }}" != "success" ]; then
+            echo "服务未全部就绪，详见 Job Summary 与 artifact：e2e-service-logs"
+            rc=1
+          fi
+          if [ "${{ steps.smoke.outcome }}" != "success" ]; then
+            echo "冒烟未全绿，详见 Job Summary 与 artifact：e2e-service-logs"
+            rc=1
+          fi
+          exit $rc

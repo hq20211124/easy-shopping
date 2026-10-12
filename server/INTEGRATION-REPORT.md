@@ -106,11 +106,97 @@
 
 | 脚本 | 用法 | 说明 |
 |------|------|------|
-| `start-all.ps1` | `powershell -ExecutionPolicy Bypass -File .\start-all.ps1 [-ResetData]` | 按序拉起 12 jar，全绑 `127.0.0.1`；日志 `logs/<svc>.log|.err.log|.pid`；逐个等 `/health`；失败打印日志尾部并 `exit 1`。core-search 带 `--app.search.sync-interval-ms=5000`。`-ResetData` 先删 `server/data/` 再启动（**服务运行中不可用**）。 |
+| `start-all.ps1` | `powershell -ExecutionPolicy Bypass -File .\start-all.ps1 [-ResetData] [-JvmArgs …]` | 按序拉起 **11** 个 jar（10 业务服务 + admin-bff + gateway 中的 11 个可执行包），全绑 `127.0.0.1`；日志 `logs/<svc>.log|.err.log|.pid`；逐个等 `/health`；失败打印日志尾部并 `exit 1`。core-search 带 `--app.search.sync-interval-ms=5000`。`-ResetData` 先删 `server/data/` 再启动（**服务运行中不可用**）。`-JvmArgs` 为新增，追加给每个 JVM 的参数，默认空（仅 CI 限堆用）。 |
 | `stop-all.ps1` | `powershell -ExecutionPolicy Bypass -File .\stop-all.ps1` | 读 pid 文件停服 + 孤儿进程清扫（**同时匹配 server 目录和 `--server.address=127.0.0.1` 标记**，不误杀 WSL relay / 他人进程）+ 端口复核。 |
 | `smoke.ps1` | `powershell -ExecutionPolicy Bypass -File .\smoke.ps1` | 13 步 32 断言端到端冒烟，全部走网关 `:8080`。 |
+| `platform-lib.ps1` | 不单独执行，被上面三个 dot-source | 跨平台公共库（平台判定 / 监听端口查询 / 控制台编码 / java 命令行扫描）。 |
+| `selftest-platform-lib.ps1` | `powershell -ExecutionPolicy Bypass -File .\selftest-platform-lib.ps1` | `platform-lib.ps1` 的 19 条自测断言（见 §4.1）。 |
 
-> 脚本未加 `[Console]::OutputEncoding=UTF8`（会把本机 GBK 控制台中文搞乱，已回滚）。
+> 脚本未加 `[Console]::OutputEncoding=UTF8`（会把本机 GBK 控制台中文搞乱，已回滚）。Linux 分支才加，见 §4.1。
+
+---
+
+## 4.1 跨平台改造（为 CI e2e-smoke job，2026-10-12）
+
+背景：`.github/workflows/ci.yml` 的 `e2e-smoke` job 要在 **ubuntu runner** 上真实起全部服务并跑通
+13 步冒烟。GitHub 的 ubuntu runner 自带 PowerShell 7，所以**不重写 bash 版本**，而是让同一份
+`.ps1` 在两个平台都能跑 —— 32 条断言只有一份实现，避免出现第二份会漂移的契约校验。
+
+改造点全部收敛到新文件 `server/scripts/platform-lib.ps1`，业务脚本里不再出现任何平台分支。
+
+| # | 原写法（仅 Windows） | Windows 行为 | Linux（PowerShell 7）行为 |
+|---|-------------------|-------------|----------------------|
+| 1 | `Get-NetTCPConnection`（端口占用判定 / 停服后端口复核） | **原样保留**（NetTCPIP 模块，PS7 on Windows 也有） | `ConvertFrom-ProcNetTcp` 解析 `/proc/net/tcp` + `/proc/net/tcp6`，只取 `st == 0A`（LISTEN） |
+| 2 | `Get-CimInstance Win32_Process`（孤儿 java 进程清扫） | **原样保留** | 遍历 `/proc/<pid>/cmdline`（NUL 分隔参数） |
+| 3 | `Join-Path $env:JAVA_HOME 'bin\java.exe'` | 原样 | 按平台取 `java.exe` / `java` |
+| 4 | `"target\{0}-0.1.0-SNAPSHOT.jar"`（硬编码反斜杠） | 原样 | 三层 `Join-Path` 拼；**反斜杠在 Linux 上不是路径分隔符，原写法必然 `Test-Path` 失败** |
+| 5 | `Start-Process -WindowStyle Hidden` | 原样 | 省略该参数（`ProcessWindowStyle` 是 Win32 概念，Linux 上无效果） |
+| 6 | `netstat -ano \| findstr :8080`（端口占用排查提示） | 原样 | 换成 `ss -lntp \| grep ':8080 '` |
+| 7 | `smoke.ps1` 非 2xx 响应体取值 | `HttpWebResponse.GetResponseStream()` | 三级回退：`$_.ErrorDetails.Message` → `HttpResponseMessage.Content` → `GetResponseStream()` |
+| 8 | `smoke.ps1` 固定传 `-Headers @{}` | 原样 | 改成「hashtable 非空才传参」（PS7 参数校验更严） |
+| 9 | `start-all.ps1` 无 JVM 参数入口 | 无（不传） | 新增 `-JvmArgs`，CI 传 `-Xmx448m -XX:+UseSerialGC …` 限堆；**默认空数组，Windows 本机行为不变** |
+
+**`Get-ResponseText`（改造点 7）是本次最关键的一处**：PS 5.1 与 PS 7 的 `Invoke-WebRequest` 在非 2xx 时
+抛出的异常类型完全不同，而第 10 步（`code=3002` 缺货）、第 13 步（`1002` 未登录）等断言**完全依赖响应体**。
+不改这一处，Linux 上这批断言会假红。
+
+### Linux 分支的两处有意取舍
+
+- **不查「端口占用者」**：`/proc/net/tcp` 里的 `inode` 要映射回 pid 需要遍历 `/proc/*/fd`
+  并要求同 UID，收益很低。Linux 分支只回答「这个端口有没有人在听」（`OwningProcess = $null`），
+  排查命令直接给 `ss -lntp`。Windows 侧仍精确到 pid，行为逐字未变。
+- **控制台编码只动 Linux**：Windows 侧**完全没碰**（本机 GBK 控制台 + UTF-8 BOM 源文件，
+  历史上试过 `[Console]::OutputEncoding=UTF8` 反而把中文搞乱，已回滚，见 §4 尾注）；
+  Linux 侧显式钉 UTF-8，保证 Actions 日志与 Job Summary 里中文可读。
+
+### 自测
+
+`server/scripts/selftest-platform-lib.ps1`（19 条断言）：把 `/proc` 解析拆成纯函数
+`ConvertFrom-ProcNetTcp -Path <文件> -Port <端口> -Family <4|6>`，对着样本文件断言
+「只取 LISTEN」「端口按十六进制匹配（8080 = `1F90`）」「非 0A 状态被忽略」「文件不存在不抛异常」。
+**Linux 分支在本机（Windows）跑不到，只能靠这个保证两端都对 —— 以后加跨平台原语请同步加断言。**
+
+自测在编写过程中抓出 2 个真 bug（都已修）：IPv4 还原循环下标写成 7/5/3/1（最后一次 `Substring` 越界）、
+端口十六进制被当成十进制 `[int]` 转换（`1F90` 直接抛 `InvalidCast`）。
+
+---
+
+## 4.2 本地 Windows 回归（改造后重跑）
+
+改造完成后在本机（Windows PowerShell 5.1 + JDK 17 + Maven 3.9.9）重跑，三个脚本全部无回归：
+
+| 步骤 | 命令 | 结果 |
+|------|------|------|
+| 1 | `stop-all.ps1` | exit 0；正确识别并**跳过**一个非本脚本拉起的 `admin-bff`（相对路径启动，不匹配 server 目录标记） |
+| 2 | `start-all.ps1 -ResetData` | **11/11 服务就绪**，90s 内全部 `[ok]`，耗时在默认 90s 窗口内 |
+| 3 | `smoke.ps1` | **exit 0 —— 32 通过 / 0 失败**，与 §3 round 4 的 32/32 完全一致 |
+| 4 | `stop-all.ps1` | exit 0；按 pid 文件停掉 11 个进程；端口复核只剩 WSL `wslrelay` 的 `[::1]:8081/8082/8083` |
+
+> 注：第 2 步之前，8090 上有一个**上一次会话遗留**的 `admin-bff`（PID 14392，用相对 jar 路径
+> `-jar admin-bff\target\...` 手工启动，因此 pid 文件与孤儿清扫都匹配不到它）。
+> `stop-all.ps1` 正确地没有误杀它、只报了 `[warn] 8090(java:14392)`，随后手工停掉再跑完整回归。
+
+---
+
+## 4.3 CI 首次运行预期（`e2e-smoke` job）
+
+> 预期 **首次是绿的**。本 job 不像 `ios-macos` 那样「首次大概率红」——
+> 因为冒烟链路在本机已经跑通 4 轮 32/32，这次只是把它搬到 Linux 上跑。
+
+可能出现的不确定性（按可能性排序）：
+
+| 不确定性 | 说明 | 兜底 |
+|---------|------|------|
+| **11 个 JVM 在 2 核 runner 上冷启动慢** | 本机多核约 90s 就绪；runner 规格更差，给了 600s | 超时则 `start-all.ps1` 打印未就绪服务的日志尾部，`continue-on-error` 保证日志照常上传 |
+| **`core-search` 全量同步间隔 5s**（`--app.search.sync-interval-ms=5000`） | 冒烟第 3 步「搜索命中新建商品」最多轮询 20×3s，理论上够 | 偶发失败重跑即可 |
+| **限堆导致 OOM** | CI 传 `-Xmx448m -Xms96m -XX:MaxMetaspaceSize=192m -XX:+UseSerialGC -Xss512k` | 本机不限堆也只吃几百 MB；若真 OOM 会体现为「某服务进程已退出」，看 `.err.log` |
+| **`download-artifact` 布局** | 依赖「上传路径的最小公共祖先 = `server/`」 | 已有第 3 步显式校验 11 个 jar 在位，不对会立刻红并打印缺哪个 |
+| **H2 建库耗时** | 11 个库首次建表 | runner 磁盘快，通常几秒 |
+
+**绝对不要做的事**：因为 e2e-smoke 红了就去删 `smoke.ps1` 的断言。32 条断言就是它存在的意义；
+红了说明跨服务契约真的变了（就像当初那两个资金级 P0 一样），该改的是被测代码或两边不一致的契约。
+
+详细排障见 [`.github/README.md` §3.6「失败了怎么看」](../.github/README.md)。
 
 ---
 

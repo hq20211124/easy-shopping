@@ -12,6 +12,10 @@
   4) 日志：server/logs/<service>.log（stdout）、server/logs/<service>.err.log（stderr）、
      server/logs/<service>.pid（进程号，stop-all.ps1 据此停止）。
 
+  5) 跨平台（PowerShell 7 on Linux / GitHub Actions ubuntu runner）：
+     平台相关部分全部收敛到同目录的 platform-lib.ps1（Windows 侧行为与改造前逐字一致）。
+     本机仍用 Windows PowerShell 5.1（GBK 控制台 + UTF-8 BOM 源文件）执行，未变。
+
 .PARAMETER ReadyTimeoutSec
   全部服务就绪的最长等待时间（秒），默认 90。
 
@@ -19,17 +23,29 @@
   启动前删除 server/data/（各服务 H2 文件库），重置为干净库。H2 同一服务只允许一个实例，
   服务运行中不要用这个参数。
 
+.PARAMETER JvmArgs
+  追加给每个 JVM 的参数（放在 -jar 之前）。本机默认为空（保持原行为）；
+  CI 的 ubuntu runner 规格有限（2C7G 起），11 个 JVM 同时冷启动时需要限堆，
+  e2e-smoke job 实际用的是这一组：
+    -JvmArgs '-Xmx448m','-Xms96m','-XX:MaxMetaspaceSize=192m','-XX:+UseSerialGC','-Xss512k'
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File server\scripts\start-all.ps1
   powershell -ExecutionPolicy Bypass -File server\scripts\start-all.ps1 -ResetData -ReadyTimeoutSec 120
+  pwsh -NoProfile -Command "& './scripts/start-all.ps1' -ReadyTimeoutSec 600 -JvmArgs @('-Xmx448m','-Xms96m','-XX:+UseSerialGC')"   # Linux / CI
 #>
 [CmdletBinding()]
 param(
     [int]$ReadyTimeoutSec = 90,
-    [switch]$ResetData
+    [switch]$ResetData,
+    [string[]]$JvmArgs = @()
 )
 
 $ErrorActionPreference = 'Stop'
+
+# 跨平台公共库：平台判定 / 监听端口查询 / 控制台编码（Windows 侧行为保持原样）
+. (Join-Path $PSScriptRoot 'platform-lib.ps1')
+Initialize-ConsoleEncoding
 
 $ServerRoot = Split-Path -Parent $PSScriptRoot
 $Logs = Join-Path $ServerRoot 'logs'
@@ -37,16 +53,23 @@ $Data = Join-Path $ServerRoot 'data'
 if (-not (Test-Path $Logs)) { New-Item -ItemType Directory -Path $Logs | Out-Null }
 
 # ---- Java ----
+# Windows 是 bin\java.exe，Linux 是 bin/java —— 用 Join-Path 拼，别再硬编码反斜杠。
 $JavaExe = $null
+$javaNames = if (Test-IsWindows) { @('java.exe') } else { @('java') }
 if ($env:JAVA_HOME) {
-    $candidate = Join-Path $env:JAVA_HOME 'bin\java.exe'
-    if (Test-Path $candidate) { $JavaExe = $candidate }
+    foreach ($jn in $javaNames) {
+        $candidate = Join-Path (Join-Path $env:JAVA_HOME 'bin') $jn
+        if (Test-Path $candidate) { $JavaExe = $candidate; break }
+    }
 }
 if (-not $JavaExe) {
     $cmd = Get-Command java -ErrorAction SilentlyContinue
     if ($cmd) { $JavaExe = $cmd.Source }
 }
-if (-not $JavaExe) { Write-Host '[FAIL] 找不到 java.exe，请设置 JAVA_HOME（本机为 C:\Android\jdk-17）' -ForegroundColor Red; exit 1 }
+if (-not $JavaExe) {
+    Write-Host '[FAIL] 找不到 java 可执行文件，请设置 JAVA_HOME（本机为 C:\Android\jdk-17）' -ForegroundColor Red
+    exit 1
+}
 
 # ---- 服务清单：数组顺序 = 启动顺序（gateway 最后）----
 $Services = @(
@@ -90,11 +113,12 @@ function Test-ServiceHealth {
 }
 
 # 除 [::1]（WSL relay 占的 IPv6 回环，与 127.0.0.1 绑定不冲突）外，其余监听都算占用
+# 跨平台版：Windows 走 Get-NetTCPConnection（含占用者 pid），Linux 走 /proc/net/tcp{,6}
+# （该分支不查占用者 pid，OwningProcess 为 $null，只回答「有没有人在听」）。
 function Get-BlockingListeners {
     param([int]$Port)
     $found = @()
-    $conns = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-    foreach ($c in @($conns)) {
+    foreach ($c in @(Get-ListeningSocket -Port $Port)) {
         if ($c.LocalAddress -eq '::1') { continue }
         $found += $c
     }
@@ -130,6 +154,13 @@ function Stop-StartedServices {
     }
 }
 
+# jar 路径必须用嵌套 Join-Path 拼：
+# 原写法 "target\{0}-0.1.0-SNAPSHOT.jar" 在 Linux 上是单文件名，反斜杠不是路径分隔符，Test-Path 必挂。
+function Get-ServiceJarPath {
+    param([string]$Name)
+    return (Join-Path (Join-Path (Join-Path $ServerRoot $Name) 'target') ("{0}-0.1.0-SNAPSHOT.jar" -f $Name))
+}
+
 # ---- 前置检查 ----
 if ($ResetData) {
     if (Test-Path $Data) {
@@ -140,13 +171,17 @@ if ($ResetData) {
 
 $missing = @()
 foreach ($svc in $Services) {
-    $jar = Join-Path (Join-Path $ServerRoot $svc.Name) ("target\{0}-0.1.0-SNAPSHOT.jar" -f $svc.Name)
+    $jar = Get-ServiceJarPath -Name $svc.Name
     if (-not (Test-Path $jar)) { $missing += $jar }
 }
 if ($missing.Count -gt 0) {
     Write-Host '[FAIL] 缺少可执行 jar：' -ForegroundColor Red
     $missing | ForEach-Object { Write-Host ("       " + $_) -ForegroundColor Red }
-    Write-Host '       先执行：$env:JAVA_HOME="C:\Android\jdk-17"; cd server; C:\D\tools\maven\bin\mvn.cmd -q -DskipTests package' -ForegroundColor Yellow
+    if (Test-IsWindows) {
+        Write-Host '       先执行：$env:JAVA_HOME="C:\Android\jdk-17"; cd server; C:\D\tools\maven\bin\mvn.cmd -q -DskipTests package' -ForegroundColor Yellow
+    } else {
+        Write-Host '       先执行：cd server && mvn -B -ntp -DskipTests package' -ForegroundColor Yellow
+    }
     exit 1
 }
 
@@ -165,27 +200,40 @@ foreach ($svc in $Services) {
 
     $blocking = @(Get-BlockingListeners -Port $port)
     if ($blocking.Count -gt 0) {
-        $owners = ($blocking | ForEach-Object { '{0}:{1}' -f $_.LocalAddress, $_.OwningProcess }) -join ', '
+        $owners = ($blocking | ForEach-Object {
+            '{0}:{1}' -f $_.LocalAddress, $(if ($null -eq $_.OwningProcess) { '?' } else { $_.OwningProcess })
+        }) -join ', '
         Write-Host ("[FAIL] 端口 {0} 被非本脚本进程占用（{1}），请先处理：" -f $port, $owners) -ForegroundColor Red
-        Write-Host ("       netstat -ano | findstr :{0}" -f $port) -ForegroundColor Yellow
+        Write-Host ("       " + (Get-PortOwnerHint -Port $port)) -ForegroundColor Yellow
         $failed = $true
         break
     }
 
-    $jar = Join-Path (Join-Path $ServerRoot $svc.Name) ("target\{0}-0.1.0-SNAPSHOT.jar" -f $svc.Name)
+    $jar = Get-ServiceJarPath -Name $name
     $log = Join-Path $Logs ($name + '.log')
     $err = Join-Path $Logs ($name + '.err.log')
     foreach ($f in @($log, $err)) { if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue } }
 
-    $argList = @('-jar', ('"{0}"' -f $jar), '--server.address=127.0.0.1')
+    $argList = @()
+    $argList += $JvmArgs
+    $argList += @('-jar', ('"{0}"' -f $jar), '--server.address=127.0.0.1')
     $argList += $UrlOverrides
     if ($svc.ContainsKey('Extra')) { $argList += $svc.Extra }
 
+    # -WindowStyle Hidden 只在 Windows 上有意义（.NET 的 ProcessWindowStyle 是 Win32 概念），
+    # Linux 上虽然 Start-Process 接受该参数，但没有任何效果，省掉以免不同 pwsh 版本行为差异。
+    $startParams = @{
+        FilePath               = $JavaExe
+        ArgumentList           = $argList
+        WorkingDirectory       = $ServerRoot
+        RedirectStandardOutput = $log
+        RedirectStandardError  = $err
+        PassThru               = $true
+    }
+    if (Test-IsWindows) { $startParams.WindowStyle = 'Hidden' }
+
     try {
-        $proc = Start-Process -FilePath $JavaExe -ArgumentList $argList `
-            -WorkingDirectory $ServerRoot `
-            -RedirectStandardOutput $log -RedirectStandardError $err `
-            -WindowStyle Hidden -PassThru
+        $proc = Start-Process @startParams
     } catch {
         Write-Host ("[FAIL] {0} 启动失败：{1}" -f $name, $_.Exception.Message) -ForegroundColor Red
         $failed = $true
@@ -204,7 +252,7 @@ if ($failed) {
 
 # ---- 等待就绪 ----
 if ($started.Count -eq 0) {
-    Write-Host '[done] 12 个服务均已在运行' -ForegroundColor Green
+    Write-Host ("[done] {0} 个服务均已在运行" -f $Services.Count) -ForegroundColor Green
     exit 0
 }
 
@@ -249,5 +297,9 @@ Write-Host ''
 Write-Host '[done] 全部服务就绪：' -ForegroundColor Green
 foreach ($s in $started) { Write-Host ("       {0,-15} http://127.0.0.1:{1}" -f $s.Name, $s.Port) }
 Write-Host ('       gateway 统一入口：http://127.0.0.1:8080')
-Write-Host ('  下一步：powershell -ExecutionPolicy Bypass -File server\scripts\smoke.ps1')
+if (Test-IsWindows) {
+    Write-Host ('  下一步：powershell -ExecutionPolicy Bypass -File server\scripts\smoke.ps1')
+} else {
+    Write-Host ('  下一步：pwsh -File server/scripts/smoke.ps1')
+}
 exit 0

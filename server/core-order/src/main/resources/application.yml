@@ -28,6 +28,18 @@ app:
     secret: ${APP_JWT_SECRET:dev-only-secret-change-me-in-prod-0123456789abcdef}
     access-ttl-seconds: 7200
     refresh-ttl-seconds: 604800
+  crypto:
+    receiver-mobile:
+      # 收货人手机号落库加密（审计 P1 登记项）。默认开启；生产建议常开，
+      # 仅在「密文链路故障需立刻恢复下单」时临时关闭（关闭只停写不停读）。
+      enabled: true
+      # keyring：keyId=base64(32字节密钥)，英文逗号分隔，**第一个为当前加密密钥**，其余仅用于解密。
+      # P0/P1 无 KMS/Vault，密钥经配置注入；生产必须用环境变量覆盖下面的 dev 默认值
+      # （绝不能把 dev key 上生产）。轮换方式：新密钥放首位并保留旧密钥 → 新数据用新密钥，
+      # 存量刷数完成后（旧密钥无引用）再摘除旧密钥。
+      keyring: ${APP_CRYPTO_RECEIVER_MOBILE_KEYRING:k1=ZGV2LW9yZGVyLW1vYmlsZS1rZXktMzJieXRlLTAwMDE=}
+      # 存量明文手机号一次性刷数开关，默认关闭（一次性运维动作，刷完请改回 false）。
+      backfill-enabled: false
 
 # 服务间调用静态地址（P0 无 Nacos；跨服务调用用 RestClient + 读取本配置）
 service:

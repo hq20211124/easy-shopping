@@ -5,6 +5,7 @@ import com.easyshopping.common.api.BizException;
 import com.easyshopping.common.api.MaskUtil;
 import com.easyshopping.common.api.PageResult;
 import com.easyshopping.common.id.SnowflakeIdGenerator;
+import com.order.crypto.ReceiverMobileCipher;
 import com.order.domain.OrderItem;
 import com.order.domain.OrderMain;
 import com.order.domain.OrderStatus;
@@ -35,6 +36,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /**
@@ -47,6 +49,10 @@ import java.util.stream.Collectors;
  * {@code com.easyshopping.common.api.MaskUtil}），管理端列表/详情与买家端列表/详情一律不返回明文；
  * 管理端确需明文（发货/联系快递）只能走 {@link #receiverMobileForShip} 的
  * <b>带专门权限码 + 留痕</b>专用接口，禁止批量导出。</p>
+ *
+ * <p><b>存储口径</b>：手机号落库已是 AES-256-GCM 密文（{@link ReceiverMobileCipher} + Converter，
+ * 见模块 README 11 节），本类拿到的一律是<b>解密后</b>的明文，出参仍按上述口径脱敏；
+ * {@link #piiRead} 负责把 JPA 层层包装的解密异常还原为带原因的 9999 业务异常。</p>
  */
 @Service
 public class OrderQueryService {
@@ -92,6 +98,10 @@ public class OrderQueryService {
     /** 买家订单详情（含子单、金额明细、timeline；越权访问按 4001 防 IDOR 探测）。 */
     @Transactional(readOnly = true)
     public OrderDetailVO buyerDetail(Long orderId, Long userId) {
+        return piiRead(() -> buyerDetailInternal(orderId, userId));
+    }
+
+    private OrderDetailVO buyerDetailInternal(Long orderId, Long userId) {
         OrderMain parent = lifecycleService.ownedParent(orderId, userId);
         List<OrderMain> children = orderMainRepository.findByParentOrderNo(parent.getOrderNo());
         List<OrderMain> group = new ArrayList<>();
@@ -144,9 +154,11 @@ public class OrderQueryService {
      */
     @Transactional(readOnly = true)
     public InternalOrderSnapshot internalOrder(Long orderId) {
-        OrderMain order = orderMainRepository.findById(orderId)
-                .orElseThrow(() -> new BizException(BizErrorCode.ORDER_NOT_FOUND, "订单不存在: " + orderId));
-        return InternalOrderSnapshot.of(order);
+        return piiRead(() -> {
+            OrderMain order = orderMainRepository.findById(orderId)
+                    .orElseThrow(() -> new BizException(BizErrorCode.ORDER_NOT_FOUND, "订单不存在: " + orderId));
+            return InternalOrderSnapshot.of(order);
+        });
     }
 
     // ------------------------------------------------------------------ 管理端
@@ -155,6 +167,11 @@ public class OrderQueryService {
     @Transactional(readOnly = true)
     public PageResult<AdminOrderVO> adminList(Long userId, Integer orderStatus, Long storeId, String orderNo,
                                               boolean includeChildren, int pageNum, int pageSize) {
+        return piiRead(() -> adminListInternal(userId, orderStatus, storeId, orderNo, includeChildren, pageNum, pageSize));
+    }
+
+    private PageResult<AdminOrderVO> adminListInternal(Long userId, Integer orderStatus, Long storeId, String orderNo,
+                                                      boolean includeChildren, int pageNum, int pageSize) {
         Specification<OrderMain> spec = (root, query, cb) -> {
             List<jakarta.persistence.criteria.Predicate> predicates = new ArrayList<>();
             if (!includeChildren) {
@@ -186,8 +203,8 @@ public class OrderQueryService {
     /** 管理端订单详情（含明细与子单）。 */
     @Transactional(readOnly = true)
     public AdminOrderVO adminDetail(Long orderId) {
-        return toAdminVO(orderMainRepository.findById(orderId)
-                .orElseThrow(() -> new BizException(BizErrorCode.ORDER_NOT_FOUND, "订单不存在: " + orderId)));
+        return piiRead(() -> toAdminVO(orderMainRepository.findById(orderId)
+                .orElseThrow(() -> new BizException(BizErrorCode.ORDER_NOT_FOUND, "订单不存在: " + orderId))));
     }
 
     /**
@@ -212,11 +229,35 @@ public class OrderQueryService {
      */
     @Transactional
     public ReceiverMobileView receiverMobileForShip(String orderNo, Long adminId) {
-        OrderMain order = orderMainRepository.findByOrderNo(orderNo)
-                .orElseThrow(() -> new BizException(BizErrorCode.ORDER_NOT_FOUND, "订单不存在: " + orderNo));
-        // 留痕：复用订单状态流水（不新建表），from==to 表示「无状态变更的操作留痕」
-        orderStatusLogRepository.save(OrderStatusLog.receiverMobileViewed(idGenerator.nextId(), order, adminId));
-        return new ReceiverMobileView(order.getOrderNo(), order.getReceiverMobile());
+        return piiRead(() -> {
+            OrderMain order = orderMainRepository.findByOrderNo(orderNo)
+                    .orElseThrow(() -> new BizException(BizErrorCode.ORDER_NOT_FOUND, "订单不存在: " + orderNo));
+            // 留痕：复用订单状态流水（不新建表），from==to 表示「无状态变更的操作留痕」
+            orderStatusLogRepository.save(OrderStatusLog.receiverMobileViewed(idGenerator.nextId(), order, adminId));
+            return new ReceiverMobileView(order.getOrderNo(), order.getReceiverMobile());
+        });
+    }
+
+    /**
+     * 读取链路的密文失败还原：加解密在 JPA {@code AttributeConverter} 里，异常会被 JPA 规范
+     * （{@code PersistenceException}）与 Spring Data 异常翻译（{@code JpaSystemException}）<b>连包两层</b>，
+     * 直接冒泡只会得到一句无信息量的「系统错误」。这里把 {@link ReceiverMobileCipher} 抛的原始 9999
+     * 业务异常沿 cause 链还原出来，让接口/日志明确区分「密文被篡改」「缺密钥」「格式非法」三类
+     * PII 故障（码仍是 9999，fail-closed 语义不变）。
+     *
+     * <p>catch 范围是 {@code RuntimeException} 但只做「有 PII 因果才改写、否则原样抛出」，
+     * 不改变任何既有异常语义（找不到 PII 异常时原异常直接继续上抛）。</p>
+     */
+    private static <T> T piiRead(Supplier<T> action) {
+        try {
+            return action.get();
+        } catch (RuntimeException e) {
+            BizException pii = ReceiverMobileCipher.unwrapPiiFailure(e);
+            if (pii != null) {
+                throw pii;
+            }
+            throw e;
+        }
     }
 
     // ------------------------------------------------------------------ 组装
@@ -237,7 +278,9 @@ public class OrderQueryService {
      *
      * <p>口径与 core-user 一致；算法已收敛为公共工具 {@link MaskUtil}（审计登记项：
      * MaskUtil 从 core-user 提到 common）。本方法保留为薄委托，避免既有调用方/用例失效。
-     * 落库明文（P1 改 AES-256-GCM 密文存储 + 解密后按本规则脱敏），
+     * <b>落库已是 AES-256-GCM 密文</b>（审计 P1 登记项，{@link ReceiverMobileCipher} +
+     * {@link com.order.crypto.ReceiverMobileConverter}）：实体内存里是解密后的明文，
+     * 本方法照旧按 plans 规则脱敏，存量明文行同样按明文脱敏；
      * 出参明文仅由 {@link #receiverMobileForShip} 的带权限 + 留痕接口提供。</p>
      */
     public static String maskMobile(String mobile) {

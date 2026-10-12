@@ -1,5 +1,6 @@
 # prod 环境：切换 MySQL（P0 未提供 MySQL 环境，此文件仅留配置位）
 # P1 启用时：1) 引入 mysql-connector-j 依赖；2) 下方配置生效；3) 依 16.4.1 用 Flyway 管理 DDL。
+#
 #spring:
 #  datasource:
 #    url: jdbc:mysql://mysql-host:3306/easyshopping_core-order_db?useUnicode=true&characterEncoding=utf8mb4&useSSL=false&serverTimezone=Asia/Shanghai
@@ -9,3 +10,22 @@
 #  jpa:
 #    hibernate:
 #      ddl-auto: validate
+#
+# ---- 收货人手机号落库加密（AES-256-GCM，审计 P1 登记项）----
+# 生产必须满足：
+#   ① 密钥由环境变量/KMS 注入，**绝不使用 application.yml 里的 dev 默认 key**
+#      （base64 32 字节，可用 `openssl rand -base64 32` 生成；生成后离线留档，丢了就读不出存量数据）；
+#   ② 轮换窗口内 keyring 形如 `k2=<新>,k1=<旧>`（首位=当前加密密钥），存量刷数完成后再摘除 k1；
+#   ③ 建表 DDL 里 receiver_mobile 为 VARCHAR(255)（明文 20 长度装不下密文）。
+#      存量库用 ddl-auto=update 不会自动扩列，须手工执行一次：
+#        ALTER TABLE order_main MODIFY COLUMN receiver_mobile VARCHAR(255);
+#      （启动期 ReceiverMobileColumnGuard 会以 ERROR 提示列宽不足并给出该语句）
+#   ④ enabled 保持 true（生产建议常开）；仅「密文链路故障需立刻恢复下单」时临时置 false，
+#      注意关闭只停写不停读（历史密文行照常解密）。
+#
+#app:
+#  crypto:
+#    receiver-mobile:
+#      enabled: true
+#      keyring: ${APP_CRYPTO_RECEIVER_MOBILE_KEYRING}
+#      backfill-enabled: false

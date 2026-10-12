@@ -1,0 +1,690 @@
+name: iOS Smoke (模拟器真运行)
+
+# ============================================================================
+# 与 ci.yml 的 ios-macos **编译** job 互补：那个只验「能不能编过」，
+# 这个验「装进模拟器能不能起来、根视图有没有渲染、网络挂了有没有可见错误态」。
+#
+# 本文件是独立 workflow（不是 ci.yml 的又一个 job），原因：
+#   1. 触发条件/额度取舍与编译 job 不同（编译 job 每次 push 都跑，运行 job 只在 iOS 改动时跑）；
+#   2. 编译 job 挂了不影响本 job 继续产出「运行期现场」，反之亦然。
+# 两者同跑时互相独立，并发额度按 GitHub 规则分别计。
+#
+# ⚠️ 本文件由 Windows 开发机编写，**从未在本地执行过**（无 macOS / 无 Xcode）。
+#    首次运行的真实验证手段只有 GitHub runner 本身，请以 run 日志为准。
+# ============================================================================
+
+on:
+  # 手动触发：唯一「随时可跑、不看额度心情」的入口，也是排查问题的主入口。
+  workflow_dispatch:
+    inputs:
+      device:
+        description: '指定模拟器机型名（如 iPhone 16）。留空 = 自动挑 runner 上可用的最新 iPhone'
+        type: string
+        required: false
+        default: ''
+
+  # 只有 iOS 相关改动才跑。每次 push 都跑会把私有仓库的 macOS 额度（约 200 分钟/月）
+  # 一次烧光，所以用 paths 收窄——改 server/、web/、文档不该由 iOS 运行来把关。
+  push:
+    branches: [main, master]
+    paths:
+      - 'ios-client/**'
+      - '.github/workflows/ios-smoke.yml'
+  pull_request:
+    paths:
+      - 'ios-client/**'
+      - '.github/workflows/ios-smoke.yml'
+
+  # 每周一次（周一 UTC 18:23，避开整点的排队高峰）：paths 过滤管不到
+  # 「runner 镜像 / Xcode / 模拟器 runtime 漂移」这类外部变化，定时跑一次兜底。
+  # 代价约 15 分钟/次 ≈ 60 分钟/月。额度不足时删掉这一段即可，不影响其它触发方式。
+  schedule:
+    - cron: '23 18 * * 1'
+
+# 最小权限：只读代码仓
+permissions:
+  contents: read
+
+# PR 上连续 push 只保留最新一次（省额度）；master 与定时/手动触发不取消。
+concurrency:
+  group: ios-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ios-simulator-smoke:
+    name: ios-smoke (simctl boot → install → launch → screenshot)
+    runs-on: macos-15          # 与 ci.yml 的 ios-macos 保持同一 runner 镜像，减少变量
+    timeout-minutes: 30       # 实测量级：编译 5~12min + 模拟器启动 1~3min，其余是等待
+    env:
+      # 手动触发时可指定机型；其它触发方式下为空字符串（走自动挑选）
+      SMOKE_DEVICE: ${{ inputs.device }}
+      WORK: ${{ runner.temp }}/ios-smoke
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 xcodegen
+        # 只在缺失时装：GitHub macOS 镜像已预装 xcodegen，无条件 `brew install`
+        # 会白白花掉 1~2 分钟（brew 更新索引 + 反复报 already installed）。
+        run: |
+          set -euo pipefail
+          if command -v xcodegen >/dev/null 2>&1; then
+            echo "xcodegen 已预装：$(command -v xcodegen)"
+          else
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: 生成 Xcode 工程
+        working-directory: ios-client
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml
+          xcodebuild -list -project EasyShopping.xcodeproj
+
+      - name: 记录工具链与模拟器清单（排查 runner 镜像漂移用）
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK/state"
+          {
+            echo "== sw_vers ==";        sw_vers
+            echo; echo "== xcodebuild =="; xcodebuild -version
+            echo; echo "== sdk ==";        xcodebuild -showsdks 2>/dev/null | grep -i "iphonesimulator" || true
+            echo; echo "== xcrun simctl =="; xcrun simctl --version
+            echo; echo "== runtimes ==";    xcrun simctl list runtimes
+            echo; echo "== devices(available) =="; xcrun simctl list devices available
+          } > "$WORK/env.txt" 2>&1 || true
+          cat "$WORK/env.txt"
+
+      # ------------------------------------------------------------------
+      # 选机型：从 `simctl list` 的真实输出里挑，**不硬编码机型名与 runtime 名**。
+      # runner 镜像会随时间增删 runtime（macos-15 现在是 iOS 18.x，明年可能是 19.x），
+      # 写死 "iPhone 15 / iOS 17.2" 会在某次镜像更新后静默变成「找不到设备」的红灯。
+      # 规则：可用（isAvailable）且名字以 iPhone 开头 → 取 runtime 版本号最大的一档。
+      # ------------------------------------------------------------------
+      - name: 动态挑选模拟器
+        id: pick
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK/state"
+
+          xcrun simctl list -j devices available > "$WORK/devices.json" 2>&1 || true
+          if [ ! -s "$WORK/devices.json" ]; then
+            echo "::error::xcrun simctl list -j devices available 没有输出，无法挑选模拟器"
+            exit 1
+          fi
+
+          export SIMCTL_JSON="$WORK/devices.json"
+          PICK="$(python3 - <<'PY'
+          import json, os, re, sys
+
+          def runtime_version(runtime_id):
+              # com.apple.CoreSimulator.SimRuntime.iOS-18-2 -> (18, 2)
+              m = re.search(r"iOS[- ](\d+)[-.](\d+)", runtime_id)
+              return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+          try:
+              data = json.load(open(os.environ["SIMCTL_JSON"]))
+          except Exception as exc:
+              print("cannot parse simctl json: %s" % exc, file=sys.stderr)
+              sys.exit(2)
+
+          want = (os.environ.get("SMOKE_DEVICE") or "").strip()
+          candidates = []
+          for runtime_id, devices in (data.get("devices") or {}).items():
+              if "iOS" not in runtime_id:      # 排除 watchOS / tvOS / visionOS
+                  continue
+              for dev in devices:
+                  if not dev.get("isAvailable"):
+                      continue
+                  name = dev.get("name") or ""
+                  if not name.startswith("iPhone"):
+                      continue
+                  if want and name != want:     # 手动指定机型时严格匹配
+                      continue
+                  candidates.append((runtime_version(runtime_id), name,
+                                      dev.get("udid", ""), runtime_id))
+
+          if not candidates:
+              hint = ("未找到名为 %r 的可用 iPhone 模拟器" % want) if want \
+                     else "runner 上没有任何可用的 iPhone 模拟器（runtime 需随 Xcode 一起安装）"
+              print(hint, file=sys.stderr)
+              sys.exit(3)
+
+          # 版本号优先，其次机型名（稳定即可，不必挑 Pro Max）；同版本多机型时结果可复现。
+          candidates.sort()
+          version, name, udid, runtime_id = candidates[-1]
+          if not udid:
+              print("选中的设备没有 udid: %r" % name, file=sys.stderr)
+              sys.exit(4)
+          print("\t".join([udid, name, runtime_id, "%d.%d" % version]))
+          PY
+          )"
+
+          if [ -z "${PICK:-}" ]; then
+            echo "::error::模拟器挑选脚本没有产出结果（详见上方 stderr）"
+            exit 1
+          fi
+
+          UDID="$(printf '%s' "$PICK"    | cut -f1)"
+          NAME="$(printf '%s' "$PICK"    | cut -f2)"
+          RUNTIME="$(printf '%s' "$PICK" | cut -f3)"
+          RUNTIME_VER="$(printf '%s' "$PICK" | cut -f4)"
+
+          echo "选中模拟器：${NAME}（udid=${UDID}，runtime=${RUNTIME} iOS ${RUNTIME_VER}）"
+          # ⚠️ 必须带引号写：机型名里有空格（`iPhone 16 Pro Max`），
+          #    裸写进 env 文件再被 `. file` source 时，bash 会把 `16` 当命令去执行。
+          {
+            echo "UDID=\"$UDID\""
+            echo "NAME=\"$NAME\""
+            echo "RUNTIME=\"$RUNTIME\""
+            echo "RUNTIME_VER=\"$RUNTIME_VER\""
+          } > "$WORK/state/sim.env"
+
+          {
+            echo "udid=$UDID"
+            echo "name=$NAME"
+            echo "runtime=$RUNTIME"
+            echo "runtime_version=$RUNTIME_VER"
+          } >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # 启动模拟器。bootstatus -b 是必须的：不等待的话 install/launch 会撞上
+      # "device not booted" 或 SpringBoard 未就绪，报错与真实缺陷难以区分。
+      # ------------------------------------------------------------------
+      - name: 启动模拟器
+        run: |
+          set -uo pipefail
+          # ⚠️ GitHub 的 run 块实际是 `bash -e`，所以这里不能用 `cmd; RC=$?`：
+          #    命令非 0 会在 RC=$? 之前就把整个步骤杀掉，退出码永远写不进 state。
+          #    必须用 `|| RC=$?`，后面所有「记录退出码」的写法都遵循这条。
+          if [ -f "$WORK/state/sim.env" ]; then . "$WORK/state/sim.env"; else exit 1; fi
+
+          # 已经是 Booted 时 `simctl boot` 返回非 0，属正常情况，用 || true 兜住
+          xcrun simctl boot "$UDID" >> "$WORK/simctl-boot.log" 2>&1 || true
+
+          RC=0
+          xcrun simctl bootstatus "$UDID" -b >> "$WORK/simctl-boot.log" 2>&1 || RC=$?
+          echo "bootstatus rc=$RC"
+          if [ "$RC" -ne 0 ]; then
+            cat "$WORK/simctl-boot.log"
+            exit "$RC"
+          fi
+
+          xcrun simctl list devices | grep -F "$UDID" || true
+          echo 1 > "$WORK/state/boot.ok"
+
+      # ------------------------------------------------------------------
+      # 编译。签名参数**故意不传** CODE_SIGNING_ALLOWED=NO：
+      # 编译 job 关签名没问题，但装进模拟器要走的是「默认 ad-hoc 签名」
+      # （模拟器 SDK 下 CODE_SIGN_IDENTITY="-"），无签名的 bundle 在某些
+      # runtime 上会 install 失败。让 Xcode 用默认值最稳。
+      # ------------------------------------------------------------------
+      - name: 编译 .app（模拟器 SDK）
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project EasyShopping.xcodeproj \
+            -scheme EasyShopping \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,id=${UDID}" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            build 2>&1 | tee "$WORK/xcodebuild.log"
+
+      # 产物路径与标识都从构建结果里取，不写死 "Debug-iphonesimulator/EasyShopping.app"
+      - name: 定位 .app 产物与 bundle id
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -f "$WORK/state/sim.env" ]; then . "$WORK/state/sim.env"; else exit 1; fi
+
+          SETTINGS="$(xcodebuild \
+            -project EasyShopping.xcodeproj \
+            -scheme EasyShopping \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,id=${UDID}" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -showBuildSettings 2>/dev/null | grep -E '^[[:space:]]+(TARGET_BUILD_DIR|WRAPPER_NAME|EXECUTABLE_NAME|PRODUCT_BUNDLE_IDENTIFIER) = ' || true)"
+          printf '%s\n' "$SETTINGS" > "$WORK/build-settings.txt"
+          echo "$SETTINGS"
+
+          setting() { printf '%s\n' "$SETTINGS" | sed -n "s/^[[:space:]]*$1 = //p" | head -1; }
+
+          TARGET_BUILD_DIR="$(setting TARGET_BUILD_DIR)"
+          WRAPPER_NAME="$(setting WRAPPER_NAME)"
+          EXECUTABLE_NAME="$(setting EXECUTABLE_NAME)"
+
+          APP_PATH=""
+          if [ -n "$TARGET_BUILD_DIR" ] && [ -n "$WRAPPER_NAME" ] && [ -d "$TARGET_BUILD_DIR/$WRAPPER_NAME.app" ]; then
+            APP_PATH="$TARGET_BUILD_DIR/$WRAPPER_NAME.app"
+          else
+            APP_PATH="$(find "$RUNNER_TEMP/DerivedData/Build/Products" -maxdepth 2 -name '*.app' -type d 2>/dev/null | head -1 || true)"
+          fi
+
+          # bundle id 的真值来源是 project.yml（不硬编码）；
+          # 同时读一遍产物 Info.plist 做交叉校验——两者不一致说明工程不是这份 spec 生成的。
+          SPEC_BUNDLE_ID="$(grep -m1 'PRODUCT_BUNDLE_IDENTIFIER' ios-client/project.yml | sed 's/.*PRODUCT_BUNDLE_IDENTIFIER:[[:space:]]*//' | tr -d '" \r' || true)"
+          BUILT_BUNDLE_ID=""
+          if [ -n "$APP_PATH" ] && [ -f "$APP_PATH/Info.plist" ]; then
+            BUILT_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist" 2>/dev/null || true)"
+          fi
+
+          # 以**产物**里的标识为准去 launch（simctl 只认装进去的那个 bundle），
+          # spec 值只用来发现漂移并给出警告。
+          BUNDLE_ID="${BUILT_BUNDLE_ID:-$SPEC_BUNDLE_ID}"
+          if [ -z "$BUNDLE_ID" ]; then
+            echo "::error::无法确定 bundle id（project.yml 与产物 Info.plist 都没取到）"
+            echo 0 > "$WORK/state/app.ok"
+            exit 0   # 交给收尾步骤统一判失败，不在这里中断，避免证据全丢
+          fi
+          if [ -n "$SPEC_BUNDLE_ID" ] && [ "$SPEC_BUNDLE_ID" != "$BUNDLE_ID" ]; then
+            echo "::warning::bundle id 漂移：project.yml=$SPEC_BUNDLE_ID，产物=$BUNDLE_ID（以产物为准）"
+            echo "spec=$SPEC_BUNDLE_ID / built=$BUNDLE_ID（不一致）" > "$WORK/state/bundle-drift.txt"
+          else
+            echo "bundle id 一致：$BUNDLE_ID（project.yml = 产物 Info.plist）"
+          fi
+
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+            echo "::error::未找到编译产物 .app（build 大概率失败，先看 xcodebuild.log）"
+            echo 0 > "$WORK/state/app.ok"
+            exit 0
+          fi
+          echo "APP_PATH=$APP_PATH（$(du -sh "$APP_PATH" | cut -f1)）"
+          echo "EXECUTABLE_NAME=${EXECUTABLE_NAME:-$(basename "$APP_PATH" .app)}"
+          ls -1 "$APP_PATH" > "$WORK/app-contents.txt" || true
+
+          # 同上：值一律带引号，DerivedData 路径在某些 runner 上可能含空格
+          {
+            echo "APP_PATH=\"$APP_PATH\""
+            echo "BUNDLE_ID=\"$BUNDLE_ID\""
+            echo "SPEC_BUNDLE_ID=\"$SPEC_BUNDLE_ID\""
+            echo "BUILT_BUNDLE_ID=\"$BUILT_BUNDLE_ID\""
+            echo "EXECUTABLE_NAME=\"${EXECUTABLE_NAME:-$(basename "$APP_PATH" .app)}\""
+          } > "$WORK/state/app.env"
+          echo 1 > "$WORK/state/app.ok"
+
+      - name: 安装到模拟器
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -f "$WORK/state/sim.env" ]; then . "$WORK/state/sim.env"; fi
+          if [ -f "$WORK/state/app.env" ]; then . "$WORK/state/app.env"; fi
+
+          if [ -z "${APP_PATH:-}" ] || [ ! -d "${APP_PATH:-}" ]; then
+            echo "没有 .app 产物，跳过安装"
+            echo 99 > "$WORK/state/install.rc"
+            exit 0
+          fi
+          # `|| RC=$?` 而非 `; RC=$?`：见「启动模拟器」步骤的注释
+          RC=0
+          xcrun simctl install "$UDID" "$APP_PATH" > "$WORK/install.log" 2>&1 || RC=$?
+          echo "$RC" > "$WORK/state/install.rc"
+          echo "install rc=$RC"
+          cat "$WORK/install.log"
+
+      # launch 不让步骤失败（continue 语义）：退出码写进 state，
+      # 这样后面的存活探测、截图、日志抓取在启动失败时**照样执行**，
+      # 否则最需要的那份现场反而拿不到。
+      - name: 启动 App
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -f "$WORK/state/sim.env" ]; then . "$WORK/state/sim.env"; fi
+          if [ -f "$WORK/state/app.env" ]; then . "$WORK/state/app.env"; fi
+
+          if [ -z "${BUNDLE_ID:-}" ] || [ "$(cat "$WORK/state/install.rc" 2>/dev/null || echo 99)" -ne 0 ]; then
+            echo "前置步骤未就绪，跳过启动"
+            echo 99 > "$WORK/state/launch.rc"
+            echo "" > "$WORK/state/launch.stderr"
+            exit 0
+          fi
+
+          # SpringBoard 刚起来时 launch 可能被 "request was denied by service delegate" 挡掉，
+          # 这是模拟器冷启动的已知竞态，不是 App 缺陷，所以最多重试 3 次（5s 退避）。
+          : > "$WORK/launch.log"
+          RC=1
+          for attempt in 1 2 3; do
+            echo "--- launch 尝试 $attempt/3 ---" >> "$WORK/launch.log"
+            # ⚠️ 每轮必须把 RC 归零：`cmd || RC=$?` 只在 cmd **失败**时赋值，
+            #    成功时 RC 会保留上一轮（甚至初值）——那样一次成功的启动也会被判成失败。
+            RC=0
+            xcrun simctl launch --terminate-running-process "$UDID" "$BUNDLE_ID" \
+              >> "$WORK/launch.log" 2> "$WORK/launch.stderr" || RC=$?
+            echo "rc=$RC" >> "$WORK/launch.log"
+            if [ "$RC" -eq 0 ]; then break; fi
+            sleep 5
+          done
+
+          echo "$RC" > "$WORK/state/launch.rc"
+          cat "$WORK/launch.log"
+          echo "--- stderr ---"
+          cat "$WORK/launch.stderr"
+
+      # ------------------------------------------------------------------
+      # 「启动即崩」判定：两次采样进程是否仍在（12s / 26s）。
+      #
+      # 可靠性排序（本 job 用 ① + ②，不做像素断言）：
+      #   ① simctl launch 退出码        —— 权威。启动失败/包不存在/签名问题直接非 0。
+      #      对冷启动竞态（SpringBoard 未就绪）重试 3 次后取最终码。
+      #   ② launchctl list 里仍有 bundle —— 强。launch 返回 0 后 App 一旦崩溃即从列表消失。
+      #      探两次是为了盖住「起来 3 秒才崩」（首屏 .task 里的网络失败路径最容易出这种）。
+      #   ③ 截图非全黑                   —— 弱。**只写进 Summary，不参与成败判定**。
+      #
+      # 取舍：② 采用「fail-closed」——launchctl 跑得通但查不到进程，就判崩溃。
+      # 这样宁可是假红（截图里能直接看到 App 还在跑，人一眼就能否掉），
+      # 也不能是假绿（App 崩了 CI 还绿，那这个 job 就失去意义）。
+      #
+      # 为什么不用像素级断言：无 XCUITest target 就拿不到可访问性树，
+      # 做不了真正的 UI 断言；用颜色阈值假装断言只会制造假红假绿。
+      # 这里如实降级为「进程还在 + 有截图」。要真断言需给 project.yml 加 UI test target。
+      # ------------------------------------------------------------------
+      - name: 存活探测（两次采样）
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -f "$WORK/state/sim.env" ]; then . "$WORK/state/sim.env"; fi
+          if [ -f "$WORK/state/app.env" ]; then . "$WORK/state/app.env"; fi
+          BUNDLE_ID="${BUNDLE_ID:-}"
+          EXE="${EXECUTABLE_NAME:-}"
+
+          # bundle id 为空说明前面就没装成功。这里必须提前返回：
+          # 否则 `grep -Fq ""` 匹配任意一行，会把「什么都没装」误报成「进程存活」。
+          if [ -z "$BUNDLE_ID" ]; then
+            echo "没有可用的 bundle id，跳过存活探测（按未存活记）"
+            echo 0 > "$WORK/state/alive1"
+            echo 0 > "$WORK/state/alive2"
+            exit 0
+          fi
+
+          probe() {
+            # ① launchctl 可用时它是**权威答案**：能跑通就说明视图可信，
+            #    它没列出本 bundle = 进程真的没了。
+            #    ⚠️ 这里绝不能「launchctl 说没了就再用 ps 兜一次」：
+            #    那样 App 崩溃后 ps 里若还残留同名进程，就会被判成存活，
+            #    把本 job 唯一要抓的「启动即崩」悄悄放过。
+            #    ps 只在 launchctl **本身跑不起来**时作为降级手段。
+            LC_RC=0
+            LC_OUT="$(xcrun simctl spawn "$UDID" launchctl list 2>"$WORK/launchctl.err")" || LC_RC=$?
+
+            if [ "$LC_RC" -eq 0 ]; then
+              if printf '%s\n' "$LC_OUT" | grep -Fq "$BUNDLE_ID"; then
+                echo 1 > "$WORK/state/alive$1"
+                echo "采样 $1：launchctl 命中 $BUNDLE_ID → 进程存活"
+              else
+                echo 0 > "$WORK/state/alive$1"
+                echo "采样 $1：launchctl 可用但没有 $BUNDLE_ID → 进程已消失，判为崩溃"
+                printf '%s\n' "$LC_OUT" | head -20 > "$WORK/launchctl-snapshot-$1.txt"
+              fi
+              return 0
+            fi
+
+            # ② 降级：部分 runtime/启动阶段上 launchctl 视图不可用，改用 ps 找可执行名
+            if [ -n "$EXE" ] && xcrun simctl spawn "$UDID" ps -A -o pid,comm 2>/dev/null \
+                 | grep -Fq "$EXE"; then
+              echo 1 > "$WORK/state/alive$1"
+              echo "采样 $1：launchctl 不可用（rc=$LC_RC），ps 命中可执行名 $EXE → 判为存活（弱）"
+            else
+              echo 0 > "$WORK/state/alive$1"
+              echo "采样 $1：launchctl 不可用且 ps 也没有 $EXE → 判为崩溃"
+            fi
+            return 0
+          }
+
+          echo "等待 12s 让首屏渲染与首轮网络请求（无后端，应快速失败出错误态）"
+          sleep 12
+          probe 1
+
+          echo "再等 14s 复采，覆盖「起来几秒后才崩」的场景"
+          sleep 14
+          probe 2
+
+          echo "--- launchctl 原始输出 ---"
+          xcrun simctl spawn "$UDID" launchctl list 2>&1 | head -40 || true
+
+      - name: 抓取崩溃证据
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -f "$WORK/state/sim.env" ]; then . "$WORK/state/sim.env"; fi
+          if [ -f "$WORK/state/app.env" ]; then . "$WORK/state/app.env"; fi
+          EXE="${EXECUTABLE_NAME:-EasyShopping}"
+
+          # 1) 模拟器统一日志里的崩溃/致命错误关键字
+          xcrun simctl spawn "$UDID" log show --last 4m --style compact \
+            --predicate "process == \"$EXE\"" 2>/dev/null \
+            | tail -2000 > "$WORK/app-unified.log" || true
+
+          grep -nEi 'uncaught exception|Terminating app|Fatal error|EXC_[A-Z_]+|SIGABRT|SIGSEGV|crashed' \
+            "$WORK/app-unified.log" | head -40 > "$WORK/crash-hits.txt" || true
+          echo "--- 崩溃关键字命中 ---"
+          cat "$WORK/crash-hits.txt"
+          [ -s "$WORK/crash-hits.txt" ] && echo 1 > "$WORK/state/crashhit" || echo 0 > "$WORK/state/crashhit"
+
+          # 2) 宿主机 DiagnosticReports 里的模拟器崩溃报告（.ips/.crash）
+          mkdir -p "$WORK/crashreports"
+          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 \
+            -name "${EXE}*" -mmin -90 -type f 2>/dev/null \
+            -exec cp {} "$WORK/crashreports/" \; 2>/dev/null || true
+          ls -l "$WORK/crashreports" 2>/dev/null || true
+
+      - name: 截图
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -f "$WORK/state/sim.env" ]; then . "$WORK/state/sim.env"; fi
+          mkdir -p "$WORK/screenshots"
+          SHOT="$WORK/screenshots/launch.png"
+
+          RC=0
+          xcrun simctl io "$UDID" screenshot --type=png "$SHOT" > "$WORK/screenshot.log" 2>&1 || RC=$?
+          echo "screenshot rc=$RC"
+          cat "$WORK/screenshot.log"
+
+          if [ "$RC" -eq 0 ] && [ -s "$SHOT" ]; then
+            echo 1 > "$WORK/state/shot.ok"
+            ls -l "$SHOT"
+            # 再来一张：十几秒后的画面（此时首页应当已从「加载中」变成网络错误态）
+            sleep 5
+            xcrun simctl io "$UDID" screenshot --type=png "$WORK/screenshots/launch-later.png" \
+              >> "$WORK/screenshot.log" 2>&1 || true
+          else
+            echo 0 > "$WORK/state/shot.ok"
+          fi
+
+      # 参考信号，不参与成败判定（原因见上面「启动即崩判定」的注释）。
+      - name: 截图像素参考（弱信号，不判定）
+        if: always()
+        run: |
+          set -uo pipefail
+          SHOT="$WORK/screenshots/launch-later.png"
+          [ -s "$SHOT" ] || SHOT="$WORK/screenshots/launch.png"
+          [ -s "$SHOT" ] || { echo "无截图，跳过"; exit 0; }
+
+          echo "== sips 元信息 =="
+          sips -g pixelWidth -g pixelHeight -g format "$SHOT" 2>/dev/null || true
+
+          # sips 转 BMP（未压缩）后用 python3 标准库算亮度分布，判「是不是一张纯色死图」。
+          # 全程只用标准库，不装任何依赖；失败一律降级为 UNKNOWN，绝不影响 job 成败。
+          sips -s format bmp "$SHOT" --out "$WORK/shot.bmp" >/dev/null 2>&1 || true
+          [ -s "$WORK/shot.bmp" ] || { echo "像素参考：UNKNOWN（BMP 转换失败）"; exit 0; }
+
+          python3 - "$WORK/shot.bmp" <<'PY' || true
+          import struct, sys
+
+          data = open(sys.argv[1], "rb").read()
+          if data[:2] != b"BM":
+              print("像素参考：UNKNOWN（非 BMP）"); raise SystemExit(0)
+          pixel_offset = struct.unpack_from("<I", data, 10)[0]
+          width  = struct.unpack_from("<i", data, 18)[0]
+          height = struct.unpack_from("<i", data, 22)[0]
+          bpp    = struct.unpack_from("<H", data, 28)[0]
+          if bpp not in (24, 32) or width <= 0 or height == 0:
+              print("像素参考：UNKNOWN（bpp=%s w=%s h=%s）" % (bpp, width, height)); raise SystemExit(0)
+
+          top_down = height < 0
+          height = abs(height)
+          bytes_per_pixel = bpp // 8
+          stride = ((width * bpp + 31) // 32) * 4
+
+          total = 0; count = 0; peak = 0; buckets = set()
+          for y in range(0, height, 7):                      # 抽样即可，判死图不需要全图
+              row = y if top_down else (height - 1 - y)
+              base = pixel_offset + row * stride
+              if base + width * bytes_per_pixel > len(data):
+                  break
+              for x in range(0, width, 7):
+                  i = base + x * bytes_per_pixel
+                  b, g, r = data[i], data[i + 1], data[i + 2]
+                  luma = (r * 299 + g * 587 + b * 114) // 1000
+                  total += luma; count += 1; peak = max(peak, luma)
+                  if len(buckets) < 64:
+                      buckets.add((r >> 4, g >> 4, b >> 4))
+
+          if count == 0:
+              print("像素参考：UNKNOWN（无有效像素）"); raise SystemExit(0)
+          mean = total / count
+          flat = len(buckets) <= 4 and peak < 12
+          print("像素参考：尺寸=%dx%d 平均亮度=%.1f 峰值=%d 抽样色块=%d → %s"
+                % (width, height, mean, peak, len(buckets),
+                   "疑似全黑/纯色（仅供参考，不参与判定）" if flat else "画面有内容"))
+          PY
+
+      - name: 打包 App 产物（排查安装失败用）
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -f "$WORK/state/app.env" ]; then . "$WORK/state/app.env"; fi
+          if [ -z "${APP_PATH:-}" ] || [ ! -d "${APP_PATH:-}" ]; then
+            echo "没有 .app 产物，跳过打包"
+            exit 0
+          fi
+          tar -czf "$WORK/EasyShopping.app.tar.gz" -C "$(dirname "$APP_PATH")" "$(basename "$APP_PATH")" \
+            && ls -lh "$WORK/EasyShopping.app.tar.gz" || true
+
+      # 无论成败都要留住现场
+      - name: 上传截图与全部日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-smoke-evidence-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios-smoke/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 汇总到 Job Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          s() { cat "$WORK/state/$1" 2>/dev/null || echo "${2:-}"; }
+          if [ -f "$WORK/state/sim.env" ]; then . "$WORK/state/sim.env"; fi
+          if [ -f "$WORK/state/app.env" ]; then . "$WORK/state/app.env"; fi
+
+          BOOT_OK="$(s boot.ok 0)"; APP_OK="$(s app.ok 0)"
+          INSTALL_RC="$(s install.rc 99)"; LAUNCH_RC="$(s launch.rc 99)"
+          ALIVE1="$(s alive1 0)"; ALIVE2="$(s alive2 0)"
+          SHOT_OK="$(s shot.ok 0)"; CRASH_HIT="$(s crashhit 0)"
+
+          {
+            echo "## iOS 模拟器冒烟结果"
+            echo
+            echo "| 项 | 值 |"
+            echo "|----|----|"
+            echo "| 模拟器 | ${NAME:-?}（iOS ${RUNTIME_VER:-?}） |"
+            echo "| udid | \`${UDID:-?}\` |"
+            echo "| bundle id | \`${BUNDLE_ID:-?}\`（project.yml: \`${SPEC_BUNDLE_ID:-?}\`） |"
+            echo "| .app 产物 | \`${APP_PATH:-未产出}\` |"
+            echo "| 启动器引导 | $([ "$BOOT_OK" = 1 ] && echo ✅ || echo ❌) |"
+            echo "| 安装 | $([ "$INSTALL_RC" = 0 ] && echo ✅ || echo "❌ rc=$INSTALL_RC") |"
+            echo "| launch 退出码 | $([ "$LAUNCH_RC" = 0 ] && echo "✅ 0" || echo "❌ $LAUNCH_RC") |"
+            echo "| 进程存活（启动后 12s） | $([ "$ALIVE1" = 1 ] && echo ✅ || echo ❌) |"
+            echo "| 进程存活（启动后 26s） | $([ "$ALIVE2" = 1 ] && echo ✅ || echo ❌) |"
+            echo "| 截图 | $([ "$SHOT_OK" = 1 ] && echo ✅ || echo ❌) |"
+            echo
+            echo "CI 上**没有后端**，所以首页必然请求失败。本 job 的通过口径是："
+            echo "「**启动不崩 + 根视图渲染出来 + 网络失败有可见错误态 + 截到图**」，"
+            echo "而不是「业务可用」。截图里首页应能看到 \`ErrorStateView\`"
+            echo "（\`wifi.exclamationmark\` 图标 + 「网络异常：…」+ 「重试」按钮），"
+            echo "这正是审计要求的**静默失败治理**在运行期的验证。"
+            echo
+            if [ "$LAUNCH_RC" != 0 ]; then
+              echo "### ❌ 启动失败"
+              echo
+              echo "**\`simctl launch\` 退出码 = \`$LAUNCH_RC\`**（含最多 3 次重试后的最终结果）。"
+              echo "stderr 原文："
+              echo
+              echo '```'
+              head -c 4000 "$WORK/launch.stderr" 2>/dev/null || echo "（无 stderr）"
+              echo '```'
+              echo
+            else
+              if [ "$ALIVE1" = 1 ] && [ "$ALIVE2" = 1 ]; then
+                echo "### ⚠️ launch 返回 0，但两次存活采样都没找到进程"
+                echo
+                echo "即「**起来了又退了**」——典型形态是启动后崩溃（SwiftUI 运行期缺陷 / 首屏 \`.task\` 抛错）。"
+                echo "崩溃关键字与宿主 \`DiagnosticReports\` 见下方及 artifact。"
+              else
+                echo "### ✅ App 启动成功（进程在 12s / 26s 两次采样中均存活）"
+              fi
+              echo
+            fi
+            if [ "$CRASH_HIT" = 1 ]; then
+              echo "### ⚠️ 统一日志里命中崩溃关键字"
+              echo
+              echo '```'
+              head -c 4000 "$WORK/crash-hits.txt" 2>/dev/null || true
+              echo '```'
+              echo
+            fi
+            if [ -s "$WORK/state/bundle-drift.txt" ]; then
+              echo "### ⚠️ bundle id 漂移"
+              echo
+              echo '```'
+              cat "$WORK/state/bundle-drift.txt"
+              echo '```'
+              echo
+            fi
+            if [ "$APP_OK" != 1 ]; then
+              echo "### ❌ 未产出 .app"
+              echo "编译阶段就失败了，请看 artifact \`ios-smoke-evidence-*\` 里的 \`xcodebuild.log\`"
+              echo "（以及 ci.yml 的 \`ios-macos\` 编译 job）。"
+              echo
+            fi
+            echo "<details><summary>完整启动输出</summary>"
+            echo
+            echo '```'
+            head -c 4000 "$WORK/launch.log" 2>/dev/null || echo "（无）"
+            echo '```'
+            echo
+            echo "</details>"
+            echo
+            echo "截图 / 日志 / 崩溃报告 / \`.app\` 打包件均在 artifact \`ios-smoke-evidence-${{ github.run_attempt }}\`。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 统一的成败判定放在最后：前面的步骤一律不直接让 job 变红，
+      # 保证「失败了也拿得到截图和日志」。
+      - name: 判定冒烟结果
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -f "$WORK/state/sim.env" ]; then . "$WORK/state/sim.env"; fi
+          if [ -f "$WORK/state/app.env" ]; then . "$WORK/state/app.env"; fi
+          s() { cat "$WORK/state/$1" 2>/dev/null || echo "${2:-}"; }
+
+          REASONS=""
+          [ "$(s boot.ok 0)" = 1 ] || REASONS="$REASONS\n- 模拟器未能在时限内完成启动（bootstatus 失败）"
+          [ "$(s app.ok 0)" = 1 ] || REASONS="$REASONS\n- 没有可安装的 .app 产物（编译失败，见 xcodebuild.log）"
+          [ "$(s install.rc 99)" = 0 ] || REASONS="$REASONS\n- \`simctl install\` 返回 $(s install.rc 99)"
+          [ "$(s launch.rc 99)" = 0 ] || REASONS="$REASONS\n- \`simctl launch\` 返回 $(s launch.rc 99) —— **启动失败**"
+          [ "$(s alive1 0)" = 1 ] || REASONS="$REASONS\n- 启动后 12s 查不到 App 进程（崩溃或被回收）"
+          [ "$(s alive2 0)" = 1 ] || REASONS="$REASONS\n- 启动后 26s 查不到 App 进程（崩溃或被回收）"
+          [ "$(s shot.ok 0)" = 1 ] || REASONS="$REASONS\n- 未能截图"
+
+          if [ -z "$REASONS" ]; then
+            echo "✅ 模拟器冒烟通过：App 启动、两次存活采样均在、截图已产出。"
+            exit 0
+          fi
+          echo "❌ 模拟器冒烟失败："
+          printf "%b\n" "$REASONS"
+          echo "现场见 artifact：ios-smoke-evidence-${{ github.run_attempt }}，Job Summary 已附 launch stderr。"
+          exit 1
