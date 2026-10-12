@@ -56,11 +56,20 @@ jobs:
     runs-on: macos-15          # 与 ci.yml 的 ios-macos 保持同一 runner 镜像，减少变量
     timeout-minutes: 30       # 实测量级：编译 5~12min + 模拟器启动 1~3min，其余是等待
     env:
-      # 手动触发时可指定机型；其它触发方式下为空字符串（走自动挑选）
-      SMOKE_DEVICE: ${{ inputs.device }}
+      # 注意：这里刻意**不**写 `${{ inputs.device }}`。
+      # inputs 上下文只由 workflow_dispatch / workflow_call 填充；在 push / schedule 触发时
+      # 放在 job 级 env 里会让 GitHub 在**加载工作流**阶段就判定无效 —— 整份 workflow 0 秒失败、
+      # 一个 job 都不创建、连日志都没有（2026-10-12 首次推送即踩到，排查记录见本节）。
+      # 手动指定的机型改由下方 `写入手动指定的机型` 步骤在 dispatch 事件下写入 $GITHUB_ENV。
+      SMOKE_DEVICE: ''
       WORK: ${{ runner.temp }}/ios-smoke
     steps:
       - uses: actions/checkout@v4
+
+      - name: 写入手动指定的机型
+        # 只在手动触发时执行（此时 inputs 上下文可用）；其它触发方式保持 job env 的空串 → 自动挑选
+        if: github.event_name == 'workflow_dispatch'
+        run: echo "SMOKE_DEVICE=${{ inputs.device }}" >> "$GITHUB_ENV"
 
       - name: 准备 xcodegen
         # 只在缺失时装：GitHub macOS 镜像已预装 xcodegen，无条件 `brew install`
