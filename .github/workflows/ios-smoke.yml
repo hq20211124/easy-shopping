@@ -304,6 +304,16 @@ jobs:
             fi
           fi
 
+          # 产物在位即达标：先落 app.ok，再做 bundle id 解析。
+          # bundle id 只决定 launch 的目标，属于 best-effort；不该反过来把「产物是否就位」一起带崩
+          #（run 38265169505 就出现过产物明明存在、判定却是 no-install 的连坐失败）。
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+            echo "::error::未找到编译产物 .app（build 大概率失败，先看 xcodebuild.log）"
+            echo 0 > "$WORK/state/app.ok"
+            exit 0
+          fi
+          echo 1 > "$WORK/state/app.ok"
+
           # bundle id 的真值来源是 project.yml（不硬编码）；
           # 同时读一遍产物 Info.plist 做交叉校验——两者不一致说明工程不是这份 spec 生成的。
           SPEC_BUNDLE_ID="$(grep -m1 'PRODUCT_BUNDLE_IDENTIFIER' project.yml | sed 's/.*PRODUCT_BUNDLE_IDENTIFIER:[[:space:]]*//' | tr -d '" \r' || true)"
@@ -314,22 +324,22 @@ jobs:
 
           # 以**产物**里的标识为准去 launch（simctl 只认装进去的那个 bundle），
           # spec 值只用来发现漂移并给出警告。
-          BUNDLE_ID="${BUILT_BUNDLE_ID:-$SPEC_BUNDLE_ID}"
+          BUNDLE_ID="${BUILT_BUNDLE_ID:-${SPEC_BUNDLE_ID:-}}"
           # app.env 无论成败都先写一份（含空值）——否则后续步骤在 set -u 下引用
           # $BUNDLE_ID/$APP_PATH 会直接 unbound variable，把现场收集也一起带崩。
           {
-            echo "APP_PATH=\"$APP_PATH\""
-            echo "BUNDLE_ID=\"$BUNDLE_ID\""
-            echo "SPEC_BUNDLE_ID=\"$SPEC_BUNDLE_ID\""
-            echo "BUILT_BUNDLE_ID=\"$BUILT_BUNDLE_ID\""
+            echo "APP_PATH=\"${APP_PATH:-}\""
+            echo "BUNDLE_ID=\"${BUNDLE_ID:-}\""
+            echo "SPEC_BUNDLE_ID=\"${SPEC_BUNDLE_ID:-}\""
+            echo "BUILT_BUNDLE_ID=\"${BUILT_BUNDLE_ID:-}\""
             echo "EXECUTABLE_NAME=\"${EXECUTABLE_NAME:-}\""
           } > "$WORK/state/app.env"
-          if [ -z "$BUNDLE_ID" ]; then
+          if [ -z "${BUNDLE_ID:-}" ]; then
             echo "::error::无法确定 bundle id（project.yml 与产物 Info.plist 都没取到）"
             echo 0 > "$WORK/state/app.ok"
             exit 0   # 交给收尾步骤统一判失败，不在这里中断，避免证据全丢
           fi
-          if [ -n "$SPEC_BUNDLE_ID" ] && [ "$SPEC_BUNDLE_ID" != "$BUNDLE_ID" ]; then
+          if [ -n "${SPEC_BUNDLE_ID:-}" ] && [ "$SPEC_BUNDLE_ID" != "${BUNDLE_ID:-}" ]; then
             echo "::warning::bundle id 漂移：project.yml=$SPEC_BUNDLE_ID，产物=$BUNDLE_ID（以产物为准）"
             echo "spec=$SPEC_BUNDLE_ID / built=$BUNDLE_ID（不一致）" > "$WORK/state/bundle-drift.txt"
           else
