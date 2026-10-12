@@ -1,0 +1,19 @@
+/* 全局样式：AntD 5 为 CSS-in-JS，此处仅补充少量全局排版 */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page-card {
+  margin-bottom: 16px;
+}

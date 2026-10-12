@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.5</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.easyshopping</groupId>
+    <artifactId>easy-shopping-server</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>easy-shopping-server</name>
+    <description>电商平台后端骨架（P0 可运行，业务逻辑按 plans/ 由各域后续代理实现）</description>
+
+    <modules>
+        <module>common</module>
+        <module>gateway</module>
+        <module>core-user</module>
+        <module>core-product</module>
+        <module>core-price</module>
+        <module>core-inventory</module>
+        <module>core-cart</module>
+        <module>core-order</module>
+        <module>core-payment</module>
+        <module>core-promotion</module>
+        <module>core-search</module>
+        <module>admin-bff</module>
+    </modules>
+
+    <properties>
+        <java.version>17</java.version>
+        <!-- 平台默认编码为 GBK，强制全仓 UTF-8，否则中文注释乱码/编译失败 -->
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <spring-cloud.version>2023.0.3</spring-cloud.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring-cloud.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- 各服务统一引用 common，版本在此收敛 -->
+            <dependency>
+                <groupId>com.easyshopping</groupId>
+                <artifactId>common</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <configuration>
+                        <encoding>${project.build.sourceEncoding}</encoding>
+                    </configuration>
+                </plugin>
+                <!-- 可执行服务模块各自声明该插件（common 为普通 jar，不声明） -->
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+</project>

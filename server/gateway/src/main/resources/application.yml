@@ -1,0 +1,116 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: gateway
+  cloud:
+    gateway:
+      # P0 静态路由（无 Nacos）。uri 由 service.urls.* 覆盖，生产由服务发现/网关插件接管。
+      routes:
+        - id: core-user
+          uri: ${service.urls.core-user}
+          predicates:
+            - Path=/api/v1/auth/**,/api/v1/user/**,/api/v1/address/**
+        - id: core-product
+          uri: ${service.urls.core-product}
+          predicates:
+            - Path=/api/v1/products/**,/api/v1/category/**,/api/v1/brand/**,/api/v1/attr-template/**
+        - id: core-price
+          uri: ${service.urls.core-price}
+          predicates:
+            - Path=/api/v1/price/**,/api/v1/prices/**
+        - id: core-inventory
+          uri: ${service.urls.core-inventory}
+          predicates:
+            - Path=/api/v1/inventory/**,/api/v1/stock/**
+        - id: core-cart
+          uri: ${service.urls.core-cart}
+          predicates:
+            - Path=/api/v1/cart/**
+        - id: core-order
+          uri: ${service.urls.core-order}
+          predicates:
+            - Path=/api/v1/order/**,/api/v1/orders/**,/api/v1/logistics/**
+        - id: core-payment
+          uri: ${service.urls.core-payment}
+          predicates:
+            - Path=/api/v1/payment/**,/api/v1/payments/**
+        - id: core-promotion
+          uri: ${service.urls.core-promotion}
+          predicates:
+            - Path=/api/v1/coupon/**,/api/v1/coupons/**,/api/v1/promotion/**,/api/v1/seckill/**,/api/v1/activity/**
+        - id: core-search
+          uri: ${service.urls.core-search}
+          predicates:
+            - Path=/api/v1/search/**
+        # 管理端子域：admin-bff 未承载的细分域（类目/商品写操作/改价/优惠券）直连拥有方服务，
+        # 必须排在 admin-bff 兜底路由之前（同 order 按列表顺序匹配）。P2 拆分 admin-* 微服务后在此收敛。
+        - id: admin-category
+          uri: ${service.urls.core-product}
+          predicates:
+            - Path=/api/admin/category/**,/api/admin/categories/**
+        - id: admin-product
+          uri: ${service.urls.core-product}
+          predicates:
+            - Path=/api/admin/product/**,/api/admin/products/**
+        - id: admin-price
+          uri: ${service.urls.core-price}
+          predicates:
+            - Path=/api/admin/price/**,/api/admin/prices/**
+        - id: admin-coupon
+          uri: ${service.urls.core-promotion}
+          predicates:
+            - Path=/api/admin/coupon/**,/api/admin/coupons/**
+        # admin-bff 兜底（认证/RBAC/系统管理/订单聚合/审计/数据看板）——放最后
+        - id: admin-bff
+          uri: ${service.urls.admin-bff}
+          order: 10
+          predicates:
+            - Path=/api/admin/**
+
+# 服务静态地址（P0 无 Nacos，各服务启动后即可被网关转发）
+service:
+  urls:
+    core-user: http://localhost:8081
+    core-product: http://localhost:8082
+    core-price: http://localhost:8083
+    core-inventory: http://localhost:8084
+    core-cart: http://localhost:8085
+    core-order: http://localhost:8086
+    core-payment: http://localhost:8087
+    core-promotion: http://localhost:8088
+    core-search: http://localhost:8089
+    admin-bff: http://localhost:8090
+
+gateway:
+  auth:
+    # 免登录白名单（Ant 风格）。商品浏览/搜索/分类列表免登录；写接口与用户数据一律要 Token。
+    whitelist:
+      - /health
+      - /actuator/health
+      - /api/v1/auth/login/**
+      - /api/v1/auth/sms-code
+      - /api/v1/auth/register
+      - /api/v1/auth/refresh
+      - /api/v1/products/**
+      - /api/v1/category/**
+      - /api/v1/brand/**
+      - /api/v1/search/**
+      - /api/admin/auth/login
+      - /api/admin/auth/refresh
+      - /api/admin/auth/captcha
+  rate-limit:
+    # 单 IP QPS（P0 进程内令牌桶；<=0 关闭）。P1 换 Sentinel/网关插件同源规则。
+    permits-per-second: 100
+
+app:
+  jwt:
+    # 开发默认密钥（>=32 字节）。生产必须通过环境变量/配置中心替换！
+    secret: ${APP_JWT_SECRET:dev-only-secret-change-me-in-prod-0123456789abcdef}
+    access-ttl-seconds: 7200
+    refresh-ttl-seconds: 604800
+
+logging:
+  level:
+    com.easyshopping: info

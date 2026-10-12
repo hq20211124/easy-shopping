@@ -1,0 +1,51 @@
+server:
+  port: 8089
+
+spring:
+  application:
+    name: core-search
+  datasource:
+    # P0：H2 文件库（MySQL 兼容模式），每服务独立库文件（./data/ 已 gitignore）
+    url: jdbc:h2:file:./data/${spring.application.name};MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      # P0 骨架用 update；P1 引入 Flyway 后改 validate（plans/admin-backend.md 16.4.1）
+      ddl-auto: update
+    open-in-view: false
+
+app:
+  # 雪花 ID workerId（多实例部署时必须全局唯一，K8s 用 StatefulSet 序号注入）
+  worker-id: 9
+  jwt:
+    secret: ${APP_JWT_SECRET:dev-only-secret-change-me-in-prod-0123456789abcdef}
+    access-ttl-seconds: 7200
+    refresh-ttl-seconds: 604800
+  # 搜索冗余同步（P0：HTTP 拉取 core-product，定时全量；P1 改 MQ 增量 + ES）
+  search:
+    sync-enabled: true
+    sync-interval-ms: 60000
+    sync-initial-delay-ms: 2000
+    # 热搜种子词（无检索流量时兜底展示，逗号分隔；P1 运营后台配置下发）
+    hot-seed-words: 手机,笔记本电脑,耳机
+
+# 服务间调用静态地址（P0 无 Nacos；跨服务调用用 RestClient + 读取本配置）
+service:
+  urls:
+    core-user: http://localhost:8081
+    core-product: http://localhost:8082
+    core-price: http://localhost:8083
+    core-inventory: http://localhost:8084
+    core-cart: http://localhost:8085
+    core-order: http://localhost:8086
+    core-payment: http://localhost:8087
+    core-promotion: http://localhost:8088
+    core-search: http://localhost:8089
+    admin-bff: http://localhost:8090
+
+logging:
+  level:
+    com.easyshopping: info
+    com.search: info

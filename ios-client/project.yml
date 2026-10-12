@@ -1,0 +1,45 @@
+name: EasyShopping
+options:
+  bundleIdPrefix: com.easyshopping
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    # 语言模式 Swift 5（工具链可为 5.7+/6.x，仍按 Swift 5 模式编译）
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: 1
+    CODE_SIGN_STYLE: Automatic
+    TARGETED_DEVICE_FAMILY: "1"
+    # 真机调试时在 Xcode 里选择自己的 Team（模拟器构建不需要签名）
+
+targets:
+  EasyShopping:
+    type: application
+    platform: iOS
+    sources:
+      - path: EasyShopping
+        excludes:
+          # Info.plist 由 INFOPLIST_FILE 指定，不能再作为资源参与拷贝（否则重复输出报错）
+          - "Resources/Info.plist"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.easyshopping.app
+        INFOPLIST_FILE: EasyShopping/Resources/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    scheme:
+      build:
+        targets:
+          EasyShopping: all
+      run:
+        config: Debug
+      profile:
+        config: Release
+      analyze:
+        config: Debug
+      archive:
+        config: Release

@@ -1,0 +1,23 @@
+# XcodeGen 产物（macOS 上用 `xcodegen` 重新生成，不入库）
+*.xcodeproj
+*.xcworkspace
+!default.xcworkspace
+
+# Xcode 构建产物 / 用户态文件
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# macOS
+.DS_Store

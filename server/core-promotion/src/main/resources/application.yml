@@ -1,0 +1,50 @@
+server:
+  port: 8088
+
+spring:
+  application:
+    name: core-promotion
+  datasource:
+    # P0：H2 文件库（MySQL 兼容模式），每服务独立库文件（./data/ 已 gitignore）
+    url: jdbc:h2:file:./data/${spring.application.name};MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      # P0 骨架用 update；P1 引入 Flyway 后改 validate（plans/admin-backend.md 16.4.1）
+      ddl-auto: update
+    properties:
+      hibernate:
+        # H2(MODE=MySQL) 下 coupon_template.value 为保留字，统一引号标识符（MySQL 侧同样安全，plans DDL 本就用反引号）
+        globally_quoted_identifiers: true
+    open-in-view: false
+
+app:
+  # 雪花 ID workerId（多实例部署时必须全局唯一，K8s 用 StatefulSet 序号注入）
+  worker-id: 8
+  promotion:
+    # 过期券翻转 cron（每小时第 20 分）。测试内置为远期，避免自动触发干扰断言
+    expire-cron: "0 20 * * * *"
+  jwt:
+    secret: ${APP_JWT_SECRET:dev-only-secret-change-me-in-prod-0123456789abcdef}
+    access-ttl-seconds: 7200
+    refresh-ttl-seconds: 604800
+
+# 服务间调用静态地址（P0 无 Nacos；跨服务调用用 RestClient + 读取本配置）
+service:
+  urls:
+    core-user: http://localhost:8081
+    core-product: http://localhost:8082
+    core-price: http://localhost:8083
+    core-inventory: http://localhost:8084
+    core-cart: http://localhost:8085
+    core-order: http://localhost:8086
+    core-payment: http://localhost:8087
+    core-promotion: http://localhost:8088
+    core-search: http://localhost:8089
+    admin-bff: http://localhost:8090
+
+logging:
+  level:
+    com.easyshopping: info

@@ -41,7 +41,7 @@ AGENTS.md       本文件
 | 事实 | 真值位置 |
 |------|----------|
 | 服务命名 | `core-product`/`core-payment`（**不是** core-item/core-pay），10 个 `core-*` + 21 个 `admin-*`；`edge-gateway`（非 buyer-gateway） |
-| 订单状态机 | 8 值（1待付款/2待发货/3已发货/4退款中/5已退款/6已取消/7已关闭/8已完成），见 admin-backend 4.3 |
+| 订单状态机 | **0基** 8 值（0待付款/1待发货/2待收货/3已完成/4退款中/5已退款/6已取消/7已关闭），见 admin-backend 4.3 与 L404 DDL 注释，**不是 1 基** |
 | `order_no` 编码 | 24 位 = 时间14 + 槽位4 + 序列6，见 02-data-storage §3.2 |
 | 支付超时 | 订单表 `pay_deadline` 字段，各端不自定义分钟数 |
 | 缓存 Key | ios-backend 四段式 `{业务域}:{模块}:{标识}:{版本}`，见 03-cache §6.3 |

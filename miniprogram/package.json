@@ -1,0 +1,29 @@
+{
+  "name": "easy-shopping-miniprogram",
+  "version": "0.1.0",
+  "private": true,
+  "description": "易购商城买家小程序（uni-app + Vue3 + TS，P0 核心购物闭环）",
+  "scripts": {
+    "dev:h5": "uni",
+    "build:h5": "uni build",
+    "dev:mp-weixin": "uni -p mp-weixin",
+    "build:mp-weixin": "uni -p mp-weixin",
+    "type-check": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "@dcloudio/uni-app": "3.0.0-5020620260917001",
+    "@dcloudio/uni-components": "3.0.0-5020620260917001",
+    "@dcloudio/uni-h5": "3.0.0-5020620260917001",
+    "@dcloudio/uni-mp-weixin": "3.0.0-5020620260917001",
+    "pinia": "^2.1.7",
+    "vue": "^3.4.21"
+  },
+  "devDependencies": {
+    "@dcloudio/types": "^3.4.8",
+    "@dcloudio/vite-plugin-uni": "3.0.0-5020620260917001",
+    "sass": "^1.77.8",
+    "typescript": "~5.4.5",
+    "vite": "5.2.8",
+    "vue-tsc": "^2.0.21"
+  }
+}
