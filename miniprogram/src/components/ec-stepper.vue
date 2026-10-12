@@ -1,26 +1,36 @@
 <script setup lang="ts">
-/** 数量步进器（受控组件）。 */
-const props = defineProps<{ modelValue: number; min?: number; max?: number; disabled?: boolean }>()
-const emit = defineEmits<{ (e: 'update:modelValue', v: number): void }>()
+/** 数量步进器：v-model 受控 + change 事件（供需要落库的场景监听）。 */
+import { toRefs } from 'vue'
 
-const min = () => props.min ?? 1
-const max = () => props.max ?? 99
+const props = defineProps<{ modelValue: number; min?: number; max?: number; disabled?: boolean }>()
+const emit = defineEmits<{ (e: 'update:modelValue', v: number): void; (e: 'change', v: number): void }>()
+
+const { modelValue, min, max, disabled } = toRefs(props)
+
+const lower = () => min.value ?? 1
+const upper = () => max.value ?? 99
+
+function apply(v: number) {
+  if (v < lower() || v > upper()) return
+  emit('update:modelValue', v)
+  emit('change', v)
+}
 
 const dec = () => {
-  if (props.disabled || props.modelValue <= min()) return
-  emit('update:modelValue', props.modelValue - 1)
+  if (disabled.value || modelValue.value <= lower()) return
+  apply(modelValue.value - 1)
 }
 const inc = () => {
-  if (props.disabled || props.modelValue >= max()) return
-  emit('update:modelValue', props.modelValue + 1)
+  if (disabled.value || modelValue.value >= upper()) return
+  apply(modelValue.value + 1)
 }
 </script>
 
 <template>
   <view class="stepper">
-    <view class="stepper__btn" :class="{ 'is-disabled': disabled || modelValue <= min() }" @click="dec">−</view>
+    <view class="stepper__btn" :class="{ 'is-disabled': disabled || modelValue <= lower() }" @click="dec">−</view>
     <text class="stepper__num">{{ modelValue }}</text>
-    <view class="stepper__btn" :class="{ 'is-disabled': disabled || modelValue >= max() }" @click="inc">＋</view>
+    <view class="stepper__btn" :class="{ 'is-disabled': disabled || modelValue >= upper() }" @click="inc">＋</view>
   </view>
 </template>
 

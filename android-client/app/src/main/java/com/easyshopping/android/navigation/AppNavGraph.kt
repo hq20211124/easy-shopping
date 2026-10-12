@@ -165,8 +165,9 @@ fun AppNavGraph(
                 composable(
                     route = Screen.ProductDetail.route,
                     arguments = listOf(navArgument("spuId") { type = NavType.LongType }),
-                ) {
+                ) { entry ->
                     ProductDetailScreen(
+                        spuId = entry.arguments?.getLong("spuId") ?: -1L,
                         onBack = { navController.popBackStack() },
                         onGoCart = {
                             navController.navigate("tab_cart") {
@@ -191,8 +192,9 @@ fun AppNavGraph(
                 composable(
                     route = Screen.Pay.route,
                     arguments = listOf(navArgument("orderId") { type = NavType.LongType }),
-                ) {
+                ) { entry ->
                     PayScreen(
+                        orderId = entry.arguments?.getLong("orderId") ?: -1L,
                         onBack = { navController.popBackStack() },
                         onGoOrders = { tab ->
                             navController.navigate(Screen.OrderList.createRoute(tab)) {

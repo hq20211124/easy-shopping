@@ -67,7 +67,7 @@ class CheckoutViewModel(
         when (intent) {
             CheckoutIntent.Load -> load()
             is CheckoutIntent.SelectAddress -> setState { copy(address = intent.address) }
-            is CheckoutIntent.SelectCoupon -> setState { selectedCouponId = intent.couponId }
+            is CheckoutIntent.SelectCoupon -> setState { copy(selectedCouponId = intent.couponId) }
             is CheckoutIntent.RemarkChanged -> setState { copy(remark = intent.value.take(MAX_REMARK) ) }
             CheckoutIntent.Submit -> submit()
         }
@@ -86,18 +86,28 @@ class CheckoutViewModel(
         setState { copy(loading = true, error = "") }
         viewModelScope.launch {
             try {
+                // 结算清单：以服务端购物车 selected=true 的有效行为准（避免导航传参丢失/过期）
+                val cart = runCatching { safeCall { api.cartList() } }.getOrNull()
+                val selectedItems = cart?.items?.filter { it.selected && !it.invalid }.orEmpty()
                 // 地址：取默认地址（isDefault=true），无则取第一条
-                val addresses = runCatching { safeCall { api.addresses() } }.getOrDefault(emptyList())
+                val addresses: List<com.easyshopping.android.core.network.Address> =
+                    runCatching { safeCall { api.addresses() }.addresses }.getOrElse { emptyList() }
                 val default = addresses.firstOrNull { it.isDefault == true } ?: addresses.firstOrNull()
                 // 券：降级用 my?status=0（未使用），无 /coupon/available
-                val coupons = runCatching { safeCall { api.myCoupons(0) } }.getOrDefault(emptyList())
+                val coupons: List<com.easyshopping.android.core.network.CouponRecord> =
+                    runCatching { safeCall { api.myCoupons(0) } }.getOrElse { emptyList() }
+                val hadItems = currentState.items.isNotEmpty()
                 setState {
                     copy(
                         loading = false,
+                        items = if (hadItems) items else selectedItems,
                         addresses = addresses,
                         address = address ?: default,
                         coupons = coupons,
                     )
+                }
+                if (cart != null && !hadItems && selectedItems.isEmpty()) {
+                    sendEffect(CheckoutEffect.Toast("没有已选中的商品可结算"))
                 }
             } catch (e: Throwable) {
                 setState { copy(loading = false, error = e.toApiMessage()) }

@@ -111,8 +111,12 @@ export default function BasicLayout() {
 
   const selectedKey = useMemo(() => {
     const flat: string[] = [];
+    // 后端菜单树父节点也带 path（如 system → /system），因此父节点与子节点的 path 都要收集
     const walk = (items: PermissionMenuItem[]) =>
-      items.forEach((m) => (m.path ? flat.push(m.path) : m.children && walk(m.children)));
+      items.forEach((m) => {
+        if (m.path) flat.push(m.path);
+        if (m.children?.length) walk(m.children);
+      });
     walk(filterMenuByPermission(sourceMenus, permissions));
     const section = `/${location.pathname.split('/')[1]}/`;
     // 精确匹配优先；详情页（/product/1001 等）回退到所属模块的列表菜单

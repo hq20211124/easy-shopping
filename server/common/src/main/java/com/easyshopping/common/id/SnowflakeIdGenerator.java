@@ -8,6 +8,13 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>布局：1bit 符号 + 41bit 毫秒时间戳（自定义纪元 2024-01-01）+ 5bit workerId + 12bit 序列。
  * P0 workerId 由配置 {@code app.worker-id}（各服务各实例需唯一，K8s 可用 StatefulSet 序号/环境变量注入）。</p>
+ *
+ * <p><b>序列位留白（跨端精度契约）</b>：当前时间戳段已占 37bit，ID 落在 2^53~2^54 区间，
+ * 该区间 IEEE754 只能精确表示<b>偶数</b>整数。Web 端（web-admin / web-buyer / miniprogram）
+ * 用 JS {@code JSON.parse} 读 ID，奇数 ID 会被四舍五入成 ±1，回传后再查就是
+ * 「订单不存在 4001 / 购物车项不存在 3004」。因此序列只写 bit1~bit11（写入值恒为偶数），
+ * 让 ID 在 JS Number 下无损往返；代价是单实例每毫秒 2048 个号（足够 P0/P1）。
+ * 到 ID 超过 2^54（约 2028-05）需改走「雪花 ID 序列化为字符串」的 P1 方案。</p>
  */
 public class SnowflakeIdGenerator {
 
@@ -15,7 +22,8 @@ public class SnowflakeIdGenerator {
     private static final long WORKER_BITS = 5L;
     private static final long SEQUENCE_BITS = 12L;
     private static final long MAX_WORKER = (1L << WORKER_BITS) - 1;
-    private static final long MAX_SEQUENCE = (1L << SEQUENCE_BITS) - 1;
+    /** 内部步进上限（2^11-1）：步进左移 1 位写入 12bit 序列段，既不溢出 workerId 位段，也保证 ID 恒为偶数。 */
+    private static final long MAX_SEQUENCE_STEP = (1L << (SEQUENCE_BITS - 1)) - 1;
 
     private final long workerId;
     private final AtomicLong lastTimestamp = new AtomicLong(-1L);
@@ -36,18 +44,19 @@ public class SnowflakeIdGenerator {
             now = last;
         }
         if (now == last) {
-            long seq = sequence.incrementAndGet() & MAX_SEQUENCE;
-            if (seq == 0) {
+            long step = sequence.incrementAndGet() & MAX_SEQUENCE_STEP;
+            if (step == 0) {
                 now = waitNextMillis(last);
             }
-            sequence.set(seq);
+            sequence.set(step);
         } else {
             sequence.set(0);
         }
         lastTimestamp.set(now);
+        // 序列左移 1bit 写入（bit0 留白）→ ID 恒为偶数，JS Number 在 2^53~2^54 区间可无损表示
         return ((now - EPOCH) << (WORKER_BITS + SEQUENCE_BITS))
                 | (workerId << SEQUENCE_BITS)
-                | sequence.get();
+                | (sequence.get() << 1);
     }
 
     private long waitNextMillis(long last) {

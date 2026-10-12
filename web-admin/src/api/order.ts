@@ -53,7 +53,7 @@ export interface OrderQuery extends PageQuery {
   orderStatus?: OrderStatus | '';
 }
 
-/** core-order AdminOrderVO 原始结构（元 + Instant） */
+/** core-order AdminOrderVO 原始结构（元 + Instant）；mock 环境额外下发的可选字段用 ? 标注（真实后端缺省降级） */
 interface RawOrderItem {
   skuName: string;
   quantity: number;
@@ -80,6 +80,11 @@ interface RawOrder {
   items: RawOrderItem[] | null;
   children: Array<{ itemCount: number }> | null;
   createdAt: string;
+  /** 后端未下发（缺口）：mock 环境补发以便开发期联调，真实后端缺省时页面显示 "-" */
+  payDeadline?: string | null;
+  receiverAddress?: string | null;
+  shippedAt?: string | null;
+  adminRemarks?: Array<{ time: string; operator: string; content: string }> | null;
 }
 
 /** 元(BigDecimal) → 分 */
@@ -114,7 +119,7 @@ function toListItem(raw: RawOrder): OrderListItem {
     discount: toCents(raw.discountAmount),
     payAmount: toCents(raw.payAmount),
     payType: raw.payType ?? 0,
-    payDeadline: '',
+    payDeadline: raw.payDeadline ?? '',
     createdAt: raw.createdAt,
   };
 }
@@ -155,10 +160,11 @@ export async function getOrderDetail(id: number): Promise<OrderDetail> {
   return {
     ...toListItem(raw),
     paidAt: raw.payTime ?? null,
-    shippedAt: null,
-    receiver: { name: raw.receiverName ?? '', phone: raw.receiverMobile ?? '', address: '' },
+    // 后端 AdminOrderVO 未下发 shippedAt / receiverAddress / adminRemarks（缺口），mock 环境补发
+    shippedAt: raw.shippedAt ?? null,
+    receiver: { name: raw.receiverName ?? '', phone: raw.receiverMobile ?? '', address: raw.receiverAddress ?? '' },
     remark: raw.remark ?? '',
-    adminRemarks: [],
+    adminRemarks: raw.adminRemarks ?? [],
     version: raw.version ?? 0,
   };
 }

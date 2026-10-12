@@ -24,6 +24,7 @@ import {
   deleteAdminUser,
   listAdminUsers,
   listRoles,
+  setUserRoles,
   updateAdminUser,
   type AdminUser,
 } from '@/api/user';
@@ -61,9 +62,21 @@ export default function UserList() {
 
   const invalidate = () => void queryClient.invalidateQueries({ queryKey: ['admin-users'] });
 
+  /**
+   * 保存：新增走 create（后端 AdminUserCreateReq：username/password/roles 一次提交）；
+   * 编辑拆两步 —— 后端 AdminUserUpdateReq 不接受 roles，角色必须走 PUT /{id}/roles（SystemUserController）
+   */
   const saveMutation = useMutation({
-    mutationFn: (values: UserFormValues) =>
-      editing ? updateAdminUser(editing.id, values) : createAdminUser(values),
+    mutationFn: async (values: UserFormValues) => {
+      if (editing) {
+        const { username: _username, ...rest } = values;
+        const { roles, ...profile } = rest;
+        await updateAdminUser(editing.id, profile);
+        await setUserRoles(editing.id, roles);
+      } else {
+        await createAdminUser(values);
+      }
+    },
     onSuccess: () => {
       message.success(editing ? '用户已更新' : '用户已创建');
       setModalOpen(false);
@@ -96,7 +109,7 @@ export default function UserList() {
   const columns: TableColumnsType<AdminUser> = [
     { title: '用户名', dataIndex: 'username', width: 140 },
     { title: '姓名', dataIndex: 'nickname', width: 120 },
-    { title: '部门', dataIndex: 'deptName', width: 140 },
+    { title: '部门', dataIndex: 'deptName', width: 140, render: (v: string | null) => v ?? '-' },
     {
       title: '角色',
       dataIndex: 'roles',
@@ -108,7 +121,7 @@ export default function UserList() {
       width: 90,
       render: (v: number) => <Tag color={v === 1 ? 'success' : 'default'}>{v === 1 ? '启用' : '禁用'}</Tag>,
     },
-    { title: '最近登录', dataIndex: 'lastLoginAt', width: 170 },
+    { title: '最近登录', dataIndex: 'lastLoginAt', width: 170, render: (v: string | null) => v ?? '-' },
     {
       title: '操作',
       key: 'action',

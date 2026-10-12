@@ -101,6 +101,9 @@ export default function SystemLog() {
             }}
           />
         </Space>
+        <div style={{ marginBottom: 12, color: '#8c8c8c', fontSize: 12 }}>
+          关键字（操作人 / 模块）与时间范围互斥：填写关键字时忽略时间范围（后端 P0 限制，关键字优先）。
+        </div>
 
         <Table<OperationLog>
           rowKey="id"

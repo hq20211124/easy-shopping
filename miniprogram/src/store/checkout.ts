@@ -32,11 +32,15 @@ export const useCheckoutStore = defineStore('checkout', () => {
     address.value = a
   }
 
+  function setCoupon(id: number | null) {
+    couponId.value = id
+  }
+
   function reset() {
     lines.value = []
     couponId.value = null
     remark.value = ''
   }
 
-  return { lines, address, couponId, remark, start, setAddress, reset }
+  return { lines, address, couponId, remark, start, setAddress, setCoupon, reset }
 })

@@ -87,12 +87,17 @@ public final class RemoteSupport {
         return builder.toUriString();
     }
 
-    /** 解开统一信封：code!=0 转 BizException（HTTP 200 + 业务码路径由远端决定，此处保码保消息）。 */
+    /** 解开统一信封：code!=0 转 BizException（保码保消息，未知码兜底 9999）。 */
     public static <T> T unwrap(ApiResponse<T> resp, String service) {
         if (resp == null) {
             throw new BizException(BizErrorCode.SYSTEM_ERROR, service + " 无响应");
         }
         if (resp.code() != 0) {
+            // 透传下游业务码（如 core-order 的 4002 订单状态错误），避免被统一掩码成 9999
+            BizErrorCode mapped = BizErrorCode.fromCode(resp.code());
+            if (mapped != null) {
+                throw new BizException(mapped, resp.msg());
+            }
             throw new BizException(BizErrorCode.SYSTEM_ERROR, service + ": " + resp.msg() + " (code=" + resp.code() + ")");
         }
         return resp.data();

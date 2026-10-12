@@ -682,7 +682,7 @@ route('GET', '/api/v1/coupons/my', (_p, query) => {
 route('POST', '/api/v1/coupons/preview', (_p, _q, body) => {
   const coupon = coupons.find((c) => c.couponId === Number(body.couponId))
   if (!coupon) return err(404, '优惠券不存在')
-  const total = ((body.amount as Money[]) || []).reduce((s, a) => s + Number(a ?? 0), 0)
+  const total = ((body.amount as Money[]) || []).reduce<number>((sum, a) => sum + Number(a ?? 0), 0)
   const threshold = coupon.type === 1 ? 300 : 0
   if (total < threshold) {
     // 不满足门槛：eligible=false + reason，不抛异常（后端契约）

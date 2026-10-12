@@ -133,9 +133,18 @@ interface RawDetail {
   updatedAt: string;
 }
 
-/** core-product 列表项（Spu 实体序列化，元 + Instant） */
+/**
+ * core-product 列表项（Spu 实体直接序列化，元 + Instant）。字段名与详情 toAdminMap 不同：
+ * 列表是 `id/minPrice/marketPrice`，详情是 `spuId/price/originalPrice` → toListItem 两路兼容。
+ */
 interface RawSpu extends RawDetail {
   deleted: boolean;
+  /** 列表侧主键（= 详情的 spuId） */
+  id?: number;
+  /** 列表侧兜底价（= 详情的 price / Spu.minPrice，元） */
+  minPrice?: number | null;
+  /** 列表侧划线价（= 详情的 originalPrice / Spu.marketPrice，元） */
+  marketPrice?: number | null;
 }
 
 /* ------------------------------------------------------------ 换算工具（元 ↔ 分） */
@@ -162,13 +171,15 @@ function specText(specs: Record<string, string> | undefined): string {
 
 function toListItem(raw: RawSpu): ProductListItem {
   return {
-    id: raw.spuId,
+    // 列表接口回 id、详情接口回 spuId（字段名不一致，见 RawSpu 注释）
+    id: raw.spuId ?? raw.id,
     spuCode: raw.spuCode,
     title: raw.name,
     subtitle: raw.subtitle ?? '',
     categoryId: raw.categoryId,
-    price: toCents(raw.price),
-    linePrice: toCents(raw.originalPrice),
+    // 列表回 minPrice/marketPrice、详情回 price/originalPrice
+    price: toCents(raw.price ?? raw.minPrice),
+    linePrice: toCents(raw.originalPrice ?? raw.marketPrice),
     sales30d: raw.salesCount ?? 0,
     shelfStatus: raw.shelfStatus,
     auditStatus: raw.auditStatus,
@@ -259,13 +270,15 @@ export async function updateProduct(id: number, data: ProductUpdateParams): Prom
       const current = prices.get(sku.skuId);
       // 商品级改价：编辑框里的价格应用到该商品全部 SKU（后端无 SPU 级价格字段）
       const price = editedYuan ?? current?.price ?? raw.price ?? 0;
+      // core-price 约束 marketPrice ≥ price，否则整批同步被拒（fail-safe 仅告警）→ 改高价时须同步抬 marketPrice
+      const market = current?.marketPrice ?? price;
       return {
         skuCode: sku.skuCode,
         title: sku.title,
         spec: sku.specs,
         images: (sku.images ?? []).join(',') || raw.mainImage || undefined,
         price,
-        marketPrice: current?.marketPrice ?? price,
+        marketPrice: Math.max(market, price),
         costPrice: sku.costPrice ?? undefined,
       };
     }),

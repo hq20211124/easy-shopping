@@ -3,6 +3,10 @@
  * 契约出处：
  *  - 字典、日志：plans/admin-backend.md 2.5.2
  *  - 工作台/待办：plans/admin-backend.md 17.4（admin-data 服务）
+ * 已对齐 server 实际实现（server/admin-bff SystemDictController / SystemLogController / AdminDataController）：
+ *  - 字典类型 GET /system/dict（keyword/pageNum/pageSize）；字典项 GET /system/dict/items?type=xxx
+ *  - 日志 GET /system/operation-log：operator/module 关键字与时间范围**二选一**（关键字优先，P0 限制）
+ *  - 工作台/待办为 P0 stub（gmv/orderCount 恒 0、trend/items 恒空），P1 由 admin-data 聚合
  */
 import { get } from './request';
 import type { PageQuery, PageResult } from '@/types/api';
@@ -57,13 +61,36 @@ export interface OperationLog {
 export interface OperationLogQuery extends PageQuery {
   operator?: string;
   module?: string;
+  /** 起始时间，接受 "YYYY-MM-DD HH:mm:ss" 或 ISO 字符串，本层统一转 ISO 后端 @DateTimeFormat(ISO.DATE_TIME) */
   createdAtStart?: string;
   createdAtEnd?: string;
 }
 
-/** 操作日志列表：GET /api/admin/system/operation-log */
+/**
+ * "YYYY-MM-DD HH:mm:ss" → "YYYY-MM-DDTHH:mm:ss+08:00"（带本地时区偏移）。
+ * 后端 SystemLogController 用 @DateTimeFormat(ISO.DATE_TIME) 解析 Instant，必须含时区，
+ * 否则 400/1001；此处按浏览器本地时区补偏移，语义为「用户选择的本地墙钟时间」。
+ */
+function toIsoDateTime(value?: string): string | undefined {
+  if (!value) return undefined;
+  const iso = value.includes('T') ? value : value.replace(' ', 'T');
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso; // 交后端 1001 报错
+  const off = -d.getTimezoneOffset(); // 分钟，UTC-本地 取反 → 本地-UTC
+  const sign = off >= 0 ? '+' : '-';
+  const abs = Math.abs(off);
+  const hh = String(Math.floor(abs / 60)).padStart(2, '0');
+  const mm = String(abs % 60).padStart(2, '0');
+  return `${iso}${sign}${hh}:${mm}`;
+}
+
+/** 操作日志列表：GET /api/admin/system/operation-log（@RequirePerm system:log） */
 export function listOperationLogs(params: OperationLogQuery): Promise<PageResult<OperationLog>> {
-  return get('/admin/system/operation-log', params);
+  return get('/admin/system/operation-log', {
+    ...params,
+    createdAtStart: toIsoDateTime(params.createdAtStart),
+    createdAtEnd: toIsoDateTime(params.createdAtEnd),
+  });
 }
 
 /* ------------------------------------------------------------ 工作台（17.4 admin-data） */

@@ -168,7 +168,7 @@ fun ProductDetailScreen(
                     }
                 }
                 item(key = "spec_entry") {
-                    SpecEntryRow(detail, state.selectedSpecs) { showSpecSheet = true }
+                    SpecEntryRow(state.selectedSpecs) { showSpecSheet = true }
                 }
                 item(key = "divider1") { HorizontalDivider(color = com.easyshopping.android.core.ui.theme.Divider) }
                 item(key = "desc_title") {
@@ -193,9 +193,10 @@ fun ProductDetailScreen(
         }
     }
 
-    if (showSpecSheet && state.detail != null) {
+    val detailForSheet = state.detail
+    if (showSpecSheet && detailForSheet != null) {
         SpecSheet(
-            detail = state.detail,
+            detail = detailForSheet,
             state = state,
             onDismiss = { showSpecSheet = false },
             onSelect = { n, v -> vm.onIntent(ProductDetailIntent.SelectSpec(n, v)) },
@@ -207,7 +208,7 @@ fun ProductDetailScreen(
 
 /** 详情页规格入口：展示已选摘要，未选齐时引导选择 */
 @Composable
-private fun SpecEntryRow(detail: ProductDetail, selected: Map<String, String>, onClick: () -> Unit) {
+private fun SpecEntryRow(selected: Map<String, String>, onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()

@@ -61,4 +61,14 @@ public enum BizErrorCode {
     public String getMsg() {
         return msg;
     }
+
+    /** 按数值码反查枚举（跨服务透传下游业务码时用）；未知码返回 null，由调用方兜底。 */
+    public static BizErrorCode fromCode(int code) {
+        for (BizErrorCode c : values()) {
+            if (c.code == code) {
+                return c;
+            }
+        }
+        return null;
+    }
 }

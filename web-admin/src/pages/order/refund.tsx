@@ -99,7 +99,7 @@ export default function OrderRefund() {
             row.status === 0 ? (
               <Space size={4}>
                 <AuthButton
-                  permission="refund:approve"
+                  permission="refund:list"
                   type="link"
                   size="small"
                   onClick={() => approveMutation.mutate(row.id)}
@@ -107,7 +107,7 @@ export default function OrderRefund() {
                   同意退款
                 </AuthButton>
                 <AuthButton
-                  permission="refund:reject"
+                  permission="refund:list"
                   type="link"
                   size="small"
                   danger

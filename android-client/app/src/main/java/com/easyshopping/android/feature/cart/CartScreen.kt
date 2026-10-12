@@ -1,6 +1,7 @@
 package com.easyshopping.android.feature.cart
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -18,7 +19,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -168,15 +168,7 @@ private fun CartRow(
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(
-            imageVector = if (item.selected) Icons.Filled.CheckCircle else Icons.Filled.RadioButtonUnchecked,
-            contentDescription = if (item.selected) "取消选择" else "选择",
-            tint = if (item.selected) BrandOrange else TextSecondary,
-            modifier = Modifier
-                .clip(RoundedCornerShape(16.dp))
-                .clickable { onToggle() }
-                .padding(4.dp),
-        )
+        SelectCircle(selected = item.selected, onClick = onToggle)
         Spacer(Modifier.width(8.dp))
         AsyncImage(
             model = item.mainImage,
@@ -283,15 +275,7 @@ private fun CartSettleBar(
                 .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(
-                imageVector = if (allSelected) Icons.Filled.CheckCircle else Icons.Filled.RadioButtonUnchecked,
-                contentDescription = "全选",
-                tint = if (allSelected) BrandOrange else TextSecondary,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(16.dp))
-                    .clickable { onToggleAll() }
-                    .padding(4.dp),
-            )
+            SelectCircle(selected = allSelected, onClick = onToggleAll)
             Spacer(Modifier.width(4.dp))
             Text("全选", fontSize = 13.sp)
             Spacer(Modifier.weight(1f))
@@ -316,3 +300,29 @@ private fun CartSettleBar(
     }
 }
 
+/** 选中圆点：material-icons-core 无 RadioButtonUnchecked，手绘（同 QuantityStepper 减号做法） */
+@Composable
+private fun SelectCircle(selected: Boolean, onClick: () -> Unit) {
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .size(24.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable { onClick() },
+    ) {
+        if (selected) {
+            Icon(
+                Icons.Filled.CheckCircle,
+                contentDescription = "已选中",
+                tint = BrandOrange,
+                modifier = Modifier.size(20.dp),
+            )
+        } else {
+            Box(
+                Modifier
+                    .size(18.dp)
+                    .border(1.5.dp, TextSecondary, RoundedCornerShape(9.dp)),
+            )
+        }
+    }
+}

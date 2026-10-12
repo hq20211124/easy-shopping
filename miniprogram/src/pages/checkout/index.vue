@@ -54,14 +54,14 @@ async function loadCoupons() {
 }
 
 async function runPreview() {
-  if (previewDisabled.value) {
+  if (!couponId.value || previewDisabled.value) {
     discount.value = 0
     return
   }
   try {
     const amounts = lines.value.map((l) => fmtMoney(toCents(l.price) * l.quantity))
     const res = await couponApi.preview(couponId.value, amounts)
-    discount.value = toCents(res.discount)
+    discount.value = res.eligible ? toCents(res.discount) : 0
   } catch (e) {
     // 预览接口不可用时降级：不阻断下单，最终以创建订单返回金额为准（C1）
     void e
@@ -98,7 +98,7 @@ async function submit() {
     checkout.reset()
     // 金额以后端创建订单返回为准，跳转支付页并带订单号
     uni.redirectTo({
-      url: `/subpkg/order/pay?orderId=${res.orderId}&payAmount=${encodeURIComponent(res.payAmount)}`,
+      url: `/subpkg/order/pay?orderId=${res.orderId}&payAmount=${encodeURIComponent(fmtMoney(res.payAmount))}`,
     })
   } catch (e) {
     void e // 业务错误（如 3002 优惠券失效）toast 已处理
@@ -126,10 +126,9 @@ async function submit() {
     <!-- 商品 -->
     <view class="card">
       <view class="line row" v-for="l in lines" :key="l.skuId">
-        <image class="cover" :src="l.cover" mode="aspectFill" />
+        <image class="cover" :src="l.image" mode="aspectFill" />
         <view class="mid">
           <view class="title">{{ l.title }}</view>
-          <view class="spec">{{ l.specText }}</view>
         </view>
         <view class="right">
           <ec-price :value="l.price" :size="28" />
@@ -152,20 +151,20 @@ async function submit() {
       <view class="coupon-list" v-if="showCoupons">
         <view
           class="coupon row"
-          :class="{ dis: c.status !== 0 }"
+          :class="{ dis: c.status !== 'available' }"
           v-for="c in coupons"
-          :key="c.couponRecordId"
-          @click="c.status === 0 && pickCoupon(c.couponRecordId)"
+          :key="c.couponId"
+          @click="c.status === 'available' && pickCoupon(c.couponId)"
         >
           <view class="cleft">
-            <text class="cval">¥{{ c.value }}</text>
+            <text class="cval">{{ c.type === 3 ? '无门槛' : c.type === 1 ? '满减' : '折扣' }}</text>
           </view>
           <view class="cmid">
             <view class="cname">{{ c.name }}</view>
-            <view class="cexp">满{{ c.threshold }}可用</view>
+            <view class="cexp">{{ c.status === 'used' ? '已使用' : c.status === 'expired' ? '已过期' : '可用' }}</view>
           </view>
-          <view class="cbt" :class="{ on: couponId === c.couponRecordId }">
-            <text v-if="couponId === c.couponRecordId">✓</text>
+          <view class="cbt" :class="{ on: couponId === c.couponId }">
+            <text v-if="couponId === c.couponId">✓</text>
           </view>
         </view>
         <view class="row opt" v-if="couponId" @click="pickCoupon(null)">

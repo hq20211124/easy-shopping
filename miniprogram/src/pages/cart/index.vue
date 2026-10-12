@@ -1,55 +1,98 @@
 <script setup lang="ts">
-import { computed, onShow } from '@dcloudio/uni-app'
-import { storeToRefs } from 'pinia'
+import { computed, ref } from 'vue'
+import { onShow } from '@dcloudio/uni-app'
 import { useCartStore } from '@/store/cart'
 import { useUserStore } from '@/store/user'
 import { useCheckoutStore } from '@/store/checkout'
+import { cartApi } from '@/api/cart'
 import { fmtMoney, toCents } from '@/utils/format'
+import type { CartItemVO, CartListResponse } from '@/api/types'
 
-const cart = useCartStore()
+/** 购物车页：有效/失效分区、单选/全选、步进器、失效清理、结算。 */
+const cartStore = useCartStore()
 const user = useUserStore()
 const checkout = useCheckoutStore()
-const { lines, invalidLines, allSelected, selectedCount, selectedAmount } = storeToRefs(cart)
+
+const data = ref<CartListResponse | null>(null)
+const loading = ref(false)
+
+const validItems = computed(() => data.value?.items.filter((i) => !i.invalid) || [])
+const invalidItems = computed(() => data.value?.items.filter((i) => i.invalid) || [])
+const selectedItems = computed(() => validItems.value.filter((i) => i.selected))
+const allSelected = computed(() => validItems.value.length > 0 && validItems.value.every((i) => i.selected))
+const selectedAmount = computed(() =>
+  selectedItems.value.reduce((s, i) => s + toCents(i.price) * i.quantity, 0),
+)
+
+async function load() {
+  loading.value = true
+  try {
+    data.value = await cartApi.list()
+    cartStore.count = data.value.totalQuantity
+  } finally {
+    loading.value = false
+  }
+}
 
 onShow(() => {
-  if (user.token) cart.load()
+  if (user.token) load()
 })
 
-function toggleAll() {
-  cart.toggleAll(!allSelected.value)
+async function toggleLine(item: CartItemVO) {
+  if (item.invalid) return
+  await cartApi.update(item.cartItemId, { selected: !item.selected })
+  await load()
 }
 
-function goLogin() {
-  uni.navigateTo({ url: '/pages/login/index' })
+async function toggleAll() {
+  await cartApi.select(null, !allSelected.value)
+  await load()
 }
-function goHome() {
-  uni.switchTab({ url: '/pages/index/index' })
+
+async function changeQuantity(item: CartItemVO, quantity: number) {
+  await cartApi.update(item.cartItemId, { quantity })
+  await load()
+}
+
+async function removeLine(item: CartItemVO) {
+  await cartApi.remove([item.cartItemId])
+  uni.showToast({ title: '已删除', icon: 'none' })
+  await load()
+}
+
+async function clearInvalid() {
+  const ids = invalidItems.value.map((i) => i.cartItemId)
+  if (!ids.length) return
+  await cartApi.remove(ids)
+  await load()
 }
 
 function goDetail(skuId: number) {
   uni.navigateTo({ url: `/pages/product/detail?skuId=${skuId}` })
 }
 
+function goLogin() {
+  uni.navigateTo({ url: '/pages/login/index' })
+}
+
+function goHome() {
+  uni.switchTab({ url: '/pages/index/index' })
+}
+
 function settle() {
-  if (!user.token) {
-    uni.navigateTo({ url: '/pages/login/index' })
-    return
-  }
-  if (selectedCount.value === 0) {
+  if (!selectedItems.value.length) {
     uni.showToast({ title: '请勾选商品', icon: 'none' })
     return
   }
   checkout.start(
-    lines.value
-      .filter((l) => l.selected)
-      .map((l) => ({
-        skuId: l.skuId,
-        quantity: l.quantity,
-        title: l.title,
-        specText: l.specText,
-        cover: l.cover,
-        price: l.price,
-      })),
+    selectedItems.value.map((i) => ({
+      skuId: i.skuId,
+      title: i.title,
+      image: i.mainImage,
+      price: i.price,
+      quantity: i.quantity,
+      cartItemId: i.cartItemId,
+    })),
   )
   uni.navigateTo({ url: '/pages/checkout/index' })
 }
@@ -57,44 +100,51 @@ function settle() {
 
 <template>
   <view class="cart">
-    <view class="hd row" v-if="user.token && lines.length">
-      <text>共 {{ lines.length }} 种商品</text>
+    <view class="hd row" v-if="user.token && validItems.length">
+      <text>共 {{ validItems.length }} 种商品</text>
       <text class="link" @click="toggleAll">{{ allSelected ? '取消全选' : '全选' }}</text>
     </view>
 
     <view v-if="!user.token" class="login-tip">
       <ec-empty icon="🏠" text="请先登录后查看购物车" action-text="去登录" @action="goLogin" />
     </view>
-    <ec-empty v-else-if="!lines.length && !invalidLines.length" icon="🛒" text="购物车还是空的" action-text="去逛逛" @action="goHome" />
+    <ec-empty
+      v-else-if="!loading && !validItems.length && !invalidItems.length"
+      icon="🛒"
+      text="购物车还是空的"
+      action-text="去逛逛"
+      @action="goHome"
+    />
 
     <template v-else>
-      <view class="card" v-for="l in lines" :key="l.lineId">
+      <view class="card" v-for="l in validItems" :key="l.cartItemId">
         <view class="line row">
-          <view class="cb" :class="{ on: l.selected }" @click="cart.toggleLine(l.lineId)">
+          <view class="cb" :class="{ on: l.selected }" @click="toggleLine(l)">
             <text v-if="l.selected">✓</text>
           </view>
-          <image class="cover" :src="l.cover" mode="aspectFill" @click="goDetail(l.skuId)" />
+          <image class="cover" :src="l.mainImage" mode="aspectFill" @click="goDetail(l.skuId)" />
           <view class="mid">
             <view class="title" @click="goDetail(l.skuId)">{{ l.title }}</view>
-            <view class="spec">{{ l.specText }}</view>
+            <view class="tags" v-if="l.discountTags?.length">
+              <text class="tag" v-for="(t, i) in l.discountTags" :key="i">{{ t }}</text>
+            </view>
             <view class="row btm">
               <ec-price :value="l.price" :size="32" />
-              <ec-stepper
-                :model-value="l.quantity"
-                :min="1"
-                @change="(v: number) => cart.updateQuantity(l.skuId, v)"
-              />
+              <ec-stepper :model-value="l.quantity" :min="1" @change="(v: number) => changeQuantity(l, v)" />
             </view>
           </view>
-          <view class="del" @click="cart.removeLine(l.skuId)">×</view>
+          <view class="del" @click="removeLine(l)">×</view>
         </view>
       </view>
 
-      <view class="invalid" v-if="invalidLines.length">
-        <view class="inv-hd row">失效商品（{{ invalidLines.length }}）<text class="link" @click="cart.clearInvalid">清空</text></view>
-        <view class="line row" v-for="l in invalidLines" :key="l.lineId">
+      <view class="invalid" v-if="invalidItems.length">
+        <view class="inv-hd row">
+          失效商品（{{ invalidItems.length }}）
+          <text class="link" @click="clearInvalid">清空</text>
+        </view>
+        <view class="line row" v-for="l in invalidItems" :key="l.cartItemId">
           <view class="cb dis"></view>
-          <image class="cover gray" :src="l.cover" mode="aspectFill" />
+          <image class="cover gray" :src="l.mainImage" mode="aspectFill" />
           <view class="mid">
             <view class="title gray">{{ l.title }}</view>
             <view class="spec">已失效</view>
@@ -104,16 +154,18 @@ function settle() {
 
       <view class="placeholder"></view>
 
-      <view class="settle-bar row" v-if="lines.length">
+      <view class="settle-bar row" v-if="validItems.length">
         <view class="row total" @click="toggleAll">
           <view class="cb" :class="{ on: allSelected }"><text v-if="allSelected">✓</text></view>
           <text class="lbl">全选</text>
         </view>
         <view class="row amt">
           <text>合计：</text>
-          <ec-price :value="fmtMoney(toCents(selectedAmount))" :size="36" />
+          <ec-price :value="fmtMoney(selectedAmount)" :size="36" />
         </view>
-        <view class="btn" :class="{ dis: selectedCount === 0 }" @click="settle">结算({{ selectedCount }})</view>
+        <view class="btn" :class="{ dis: !selectedItems.length }" @click="settle">
+          结算({{ selectedItems.length }})
+        </view>
       </view>
     </template>
   </view>
@@ -186,14 +238,21 @@ function settle() {
     color: #9aa0a6;
   }
 }
+.tags {
+  margin-top: 8rpx;
+}
+.tag {
+  font-size: 20rpx;
+  color: #e4393c;
+  border: 1rpx solid #e4393c;
+  border-radius: 6rpx;
+  padding: 2rpx 8rpx;
+  margin-right: 8rpx;
+}
 .spec {
   margin-top: 8rpx;
   font-size: 22rpx;
   color: #9aa0a6;
-  background: #f5f6f8;
-  border-radius: 6rpx;
-  padding: 4rpx 12rpx;
-  display: inline-block;
 }
 .btm {
   margin-top: 14rpx;

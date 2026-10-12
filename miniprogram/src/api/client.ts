@@ -36,7 +36,7 @@ export class BizError extends Error {
 
 export interface RequestOptions {
   /** GET 时作为 query 参数（自动过滤空值）；其余方法作为 JSON body */
-  data?: Record<string, unknown>
+  data?: object
   /** 静默：不弹错误 toast（调用方自行处理） */
   silent?: boolean
 }
@@ -99,20 +99,20 @@ async function realRequest<T>(method: Method, url: string, options: RequestOptio
 
 async function request<T>(method: Method, url: string, options: RequestOptions = {}): Promise<T> {
   const envelope = USE_MOCK
-    ? await mockRequest<T>(method, url, options.data || {})
+    ? await mockRequest<T>(method, url, (options.data || {}) as Record<string, unknown>)
     : await realRequest<T>(method, url, options)
   if (envelope.code === BIZ_CODE.OK) return envelope.data
   return fail(envelope, options.silent === true)
 }
 
 export const http = {
-  get: <T>(url: string, data?: Record<string, unknown>, silent?: boolean) =>
+  get: <T>(url: string, data?: object, silent?: boolean) =>
     request<T>('GET', url, { data, silent }),
-  post: <T>(url: string, data?: Record<string, unknown>, silent?: boolean) =>
+  post: <T>(url: string, data?: object, silent?: boolean) =>
     request<T>('POST', url, { data, silent }),
-  put: <T>(url: string, data?: Record<string, unknown>, silent?: boolean) =>
+  put: <T>(url: string, data?: object, silent?: boolean) =>
     request<T>('PUT', url, { data, silent }),
-  del: <T>(url: string, data?: Record<string, unknown>, silent?: boolean) =>
+  del: <T>(url: string, data?: object, silent?: boolean) =>
     request<T>('DELETE', url, { data, silent }),
 }
 
