@@ -1,7 +1,7 @@
 package com.order.web;
 
 import com.easyshopping.common.api.ApiResponse;
-import com.order.domain.OrderMain;
+import com.order.dto.OrderDtos.InternalOrderSnapshot;
 import com.order.dto.OrderDtos.PaidRequest;
 import com.order.dto.OrderDtos.PaidResponse;
 import com.order.service.OrderLifecycleService;
@@ -12,9 +12,6 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.math.BigDecimal;
-import java.time.Instant;
-
 /**
  * 内部接口（core-payment 直连 :8086 调用，不走网关）。
  *
@@ -22,9 +19,12 @@ import java.time.Instant;
  *   <li>{@code POST /api/v1/internal/orders/{orderId}/paid} — 支付成功回调：
  *       幂等（重复回调返回 ALREADY_PAID）；与超时关单并发时 version CAS 裁决，
  *       已关单收到回调 → 自动原路退款（outcome=REFUND_TRIGGERED，android-backend 4.2.4）。</li>
- *   <li>{@code GET  /api/v1/internal/orders/{orderId} — 订单原始快照（prepay 取额 / 对账）。
+ *   <li>{@code GET  /api/v1/internal/orders/{orderId} — 订单字段快照（prepay 取额 / 对账）。
  *       <b>金额字段口径：{@code payAmount}（应付）才是支付域定额依据</b>，{@code totalAmount} 仅供对账参考。
- *       服务间调用无 X-User-Id，不能走买家 {@code /api/v1/orders/{id}}（会被 1002 拦下）。</li>
+ *       服务间调用无 X-User-Id，不能走买家 {@code /api/v1/orders/{id}}（会被 1002 拦下）。
+ *       <b>只返回 {@link InternalOrderSnapshot} 显式字段，不返回订单实体</b>：
+ *       实体整返会连同明文 {@code receiverMobile} / 收货地址一起开放给服务间调用方
+ *       （它们一个都不消费），属审计 P1 遗留项。</li>
  * </ul>
  */
 @RestController
@@ -44,27 +44,15 @@ public class InternalOrderController {
         return ApiResponse.ok(lifecycleService.markPaid(orderId, request == null ? null : request.payType()));
     }
 
-    /** 订单快照：字段名对齐 core-payment 的 {@code RestOrderClient#toSnapshot} 解析口径。 */
+    /**
+     * 订单字段快照。
+     *
+     * <p>字段名与消费口径对齐 core-payment {@code RestOrderClient#toSnapshot}，
+     * <b>字段集不得增删</b>（改名/缺失会让 prepay fail-closed 报 9999）；字段与消费方的逐一对照见
+     * {@link InternalOrderSnapshot} 类注释。</p>
+     */
     @GetMapping("/api/v1/internal/orders/{orderId}")
     public ApiResponse<InternalOrderSnapshot> snapshot(@PathVariable("orderId") Long orderId) {
-        OrderMain order = queryService.internalOrder(orderId);
-        // 支付域定额口径 = 应付金额 pay_amount（商品总额 - 优惠 + 运费）。
-        // 严禁改回 total_amount（优惠前）——有券订单会按商品总额收款，用户被多收一个券面额。
-        return ApiResponse.ok(new InternalOrderSnapshot(order.getId(), order.getUserId(),
-                order.getTotalAmount(), order.getPayAmount(), order.getOrderStatus(), order.getPayDeadline()));
-    }
-
-    /**
-     * 服务间订单快照（core-payment {@code OrderSnapshot} 的来源）。
-     *
-     * @param orderId     订单 ID（core-payment 侧兼容 orderId/id 两个字段名，这里给 orderId）
-     * @param userId      下单用户（prepay 做归属校验）
-     * @param totalAmount 商品总额（优惠前，<b>仅供参考</b>，支付域不得用作定额依据）
-     * @param payAmount   应付金额（= 商品总额 - 优惠 + 运费）——<b>支付域定额唯一口径</b>（裁决 C7 防改价）
-     * @param status      0 基 8 值订单状态（AGENTS.md 唯一事实来源）
-     * @param payDeadline 支付截止（订单表为唯一事实来源）
-     */
-    public record InternalOrderSnapshot(Long orderId, Long userId, BigDecimal totalAmount,
-                                        BigDecimal payAmount, Integer status, Instant payDeadline) {
+        return ApiResponse.ok(queryService.internalOrder(orderId));
     }
 }

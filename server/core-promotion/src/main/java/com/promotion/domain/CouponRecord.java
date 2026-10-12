@@ -3,6 +3,7 @@ package com.promotion.domain;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.Table;
 
@@ -14,9 +15,13 @@ import java.time.Instant;
  * <p>状态机（与 plans 0/1/2 语义一致）：{@code 0可用 → 1已使用}（核销，条件更新防并发重复核销）、
  * {@code 1已使用 → 0可用}（关单退回）、{@code 0可用 → 2已过期}（定时翻转）。
  * {@code 1已使用/2已过期} 不可再流转（P0；P1 若需「过期券人工恢复」另立接口）。</p>
+ *
+ * <p>索引 {@code idx_coupon_user(coupon_id, user_id)} 对齐 plans DDL，既服务「我的券/领取记录」
+ * 查询，更是<b>每人限领原子判定</b>（{@code reserveStockWithPerLimit} 的 COUNT 子查询）走索引的前提——
+ * 没有它，大促并发领取会退化成每请求全表扫描。</p>
  */
 @Entity
-@Table(name = "coupon_record")
+@Table(name = "coupon_record", indexes = @Index(name = "idx_coupon_user", columnList = "coupon_id,user_id"))
 public class CouponRecord {
 
     /** 可用（未使用）。 */

@@ -16,6 +16,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
@@ -28,8 +29,11 @@ import java.util.List;
  * 优惠券核心服务：领取（防超领/限领）、试算、核销（防重复）、退回、过期翻转、模板管理。
  *
  * <p>并发控制口径：所有会改变"券资源"的写操作均为<b>条件更新（SQL CAS）</b>——
- * 领取 {@code received < limit} 才自增、核销 {@code status=0→1} 才绑定订单，
- * 多实例部署下同样安全（不依赖进程内锁/@Version 重试）。</p>
+ * 领取：总量走条件更新（{@code received < total} 才自增），每人限领走
+ * {@code SELECT ... FOR UPDATE} 领取临界区 + {@code READ_COMMITTED} 下重查计数；
+ * 核销 {@code status=0→1} 才绑定订单。
+ * 多实例部署下同样安全（不依赖进程内锁/@Version 重试）。服务层的"先查后写"只用于
+ * <b>快速失败与错误码细分</b>，不作为并发正确性的依据。</p>
  *
  * <p><b>鉴权口径（P0-F）</b>：买家端 {@code deduct/release} 必须携带券主身份（{@code X-User-Id}），
  * 缺身份或非券主一律 1004；服务端间调用走 {@code /api/v1/internal/coupons/{id}/*}
@@ -65,13 +69,26 @@ public class CouponService {
     // ---------- 用户侧 ----------
 
     /**
-     * 领券（防超领三连击）：
-     * ① 每人限领预检（count &lt; perLimit）；② 库存预占条件更新（received &lt; total 才自增，并发只成功 N 次）；
-     * ③ 落领取记录（同事务，任一步失败整体回滚，不会泄漏预占数）。
+     * 领券（防超领 + 防限领超发）：
+     * ① 加锁读 {@code SELECT ... FOR UPDATE} 开临界区（同一模板的并发领取在此串行）；
+     * ② 临界区内判每人限领；③ 库存预占条件更新（received &lt; total 才自增，并发只成功 N 次）；
+     * ④ 落领取记录（同事务，任一步失败整体回滚，不会泄漏预占数）。
+     *
+     * <p><b>原 P1 缺陷（先查后写）</b>：服务层「先 SELECT 计数、再 INSERT」之间没有任何原子性保证——
+     * 同一用户并发 N 次领取时 N 个请求都读到 {@code owned=0 < perLimit}，全部通过预检，只要模板总量够
+     * 就全部成功，限领 1 的规则被完全突破（薅羊毛经典手法）。修复后「判限领」被移进数据库互斥临界区，
+     * 并发正确性的唯一依据是 {@code findByIdForReceive} 持有的模板行锁 + {@code READ_COMMITTED} 隔离级别
+     * （RR 下事务快照停留在加锁之前，拿到锁后仍会读到旧计数）。</p>
+     *
+     * <p><b>被否决的替代方案</b>：{@code UPDATE ... WHERE (SELECT COUNT(*) FROM coupon_record ...) < perLimit}
+     * 单语句看似原子，实测不成立——子查询按<b>语句快照</b>求值（求值发生在等待行锁之前），并发请求
+     * 一起读到 {@code COUNT=0} 全部放行（H2 实测 16 并发有 10 个同时超发）。详见
+     * {@code CouponTemplateRepository#findByIdForReceive} 的类注释。</p>
      */
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public CouponRecordResponse receive(Long templateId, long userId) {
-        CouponTemplate template = templateRepo.findById(templateId)
+        // ① 加锁读：领取临界区开始（同一模板的并发领取在此串行）
+        CouponTemplate template = templateRepo.findByIdForReceive(templateId)
                 .orElseThrow(() -> new BizException(BizErrorCode.NOT_FOUND, "优惠券不存在 couponId=" + templateId));
         Instant now = Instant.now();
         if (template.getStatus() == null || template.getStatus() != 1) {
@@ -80,11 +97,13 @@ public class CouponService {
         if (now.isBefore(template.getStartTime()) || now.isAfter(template.getEndTime())) {
             throw new BizException(BizErrorCode.ORDER_STATUS_ERROR, "优惠券活动未开始或已结束");
         }
+        // ② 临界区内判限领：计数语句在拿到锁之后才开始，读到的必然是前序并发事务已提交后的真实持券数
+        int perLimit = perLimitOf(template);
         long owned = recordRepo.countByCouponIdAndUserId(templateId, userId);
-        if (owned >= template.getPerLimit()) {
-            throw new BizException(BizErrorCode.ORDER_STATUS_ERROR,
-                    "已达每人限领数量（每人限领 " + template.getPerLimit() + " 张）");
+        if (owned >= perLimit) {
+            throw perLimitExceeded(perLimit);
         }
+        // 权威判定：库存 + 时间窗 + 生效状态在这条条件更新的 WHERE 里原子完成
         int reserved = templateRepo.reserveStock(templateId, now);
         if (reserved == 0) {
             throw new BizException(BizErrorCode.OUT_OF_STOCK, "优惠券已被领完");
@@ -94,16 +113,31 @@ public class CouponService {
         record.setCouponId(templateId);
         record.setUserId(userId);
         record.setStatus(CouponRecord.STATUS_AVAILABLE);
-        record.setExpireAt(template.getEndTime()); // 有效期取模板结束时间快照
+        record.setExpireAt(template.getEndTime()); // 有效期取模板结束时间快照（改期不追溯存量券）
         return toRecordResponse(recordRepo.save(record), template);
+    }
+
+    private BizException perLimitExceeded(int perLimit) {
+        return new BizException(BizErrorCode.ORDER_STATUS_ERROR,
+                "已达每人限领数量（每人限领 " + perLimit + " 张）");
+    }
+
+    /** 模板未显式配置限领时按 1 张兜底（与 apply() 写入默认值一致）。 */
+    private static int perLimitOf(CouponTemplate template) {
+        return template.getPerLimit() == null ? 1 : template.getPerLimit();
     }
 
     /**
      * 优惠试算：对用户持有的券按订单金额列表求和后计算优惠（满减/无门槛减面额；折扣按 value 折）。
      * 不满足门槛/状态不可用时返回 {@code eligible=false, discount=0}（不抛异常，便于前端展示原因）。
+     *
+     * <p><b>判定顺序</b>：归属 → 入参合法性 → 券状态/门槛。入参非法必须抛 1001 而不是回
+     * {@code eligible=false}——否则客户端会把「请求畸形」误读成「券不可用」而静默按原价下单
+     * （归属校验排在最前：越权请求不应泄露任何券信息）。</p>
      */
     public PreviewResponse preview(Long recordId, List<BigDecimal> amounts, long userId) {
         CouponRecord record = requireOwnedRecord(recordId, userId);
+        BigDecimal total = sumAmounts(amounts);
         if (record.getStatus() != CouponRecord.STATUS_AVAILABLE) {
             return unavailable(record, null, null, null, "券不可用（" + record.statusText() + "）");
         }
@@ -111,6 +145,17 @@ public class CouponService {
             return unavailable(record, null, null, null, "券已过期");
         }
         CouponTemplate template = requireTemplate(record.getCouponId());
+        if (total.compareTo(template.getMinAmount()) < 0) {
+            return unavailable(record, template, total, BigDecimal.ZERO,
+                    "未满足最低消费 " + template.getMinAmount());
+        }
+        BigDecimal discount = discountOf(template, total);
+        return new PreviewResponse(recordId, template.getId(), template.getName(),
+                total, discount, total.subtract(discount), true, null);
+    }
+
+    /** 金额列表求和；空/空元素/负数一律 1001（非法入参不得静默降级为「券不可用」）。 */
+    private BigDecimal sumAmounts(List<BigDecimal> amounts) {
         if (amounts == null || amounts.isEmpty()) {
             throw new BizException(BizErrorCode.PARAM_ERROR, "amount 不能为空");
         }
@@ -121,13 +166,7 @@ public class CouponService {
             }
             total = total.add(amount);
         }
-        if (total.compareTo(template.getMinAmount()) < 0) {
-            return unavailable(record, template, total, BigDecimal.ZERO,
-                    "未满足最低消费 " + template.getMinAmount());
-        }
-        BigDecimal discount = discountOf(template, total);
-        return new PreviewResponse(recordId, template.getId(), template.getName(),
-                total, discount, total.subtract(discount), true, null);
+        return total;
     }
 
     /**
@@ -262,7 +301,11 @@ public class CouponService {
         int reclaimed = 0;
         for (CouponRecord record : candidates) {
             if (record.getUsedOrderId() == null) {
-                continue; // 无订单绑定的异常数据，不动
+                // 无订单绑定的异常数据：不能凭 used_time 判断订单是否存活 → 不动，但必须留痕
+                // （否则这类数据在本方法里完全静默，运维无从发现）
+                log.warn("[coupon-deduct-reclaim] 核销记录无订单绑定，跳过（不回收）: couponRecordId={} usedTime={}",
+                        record.getId(), record.getUsedTime());
+                continue;
             }
             DeductedOrderVerifier.Outcome outcome = verifyQuietly(verifier, record);
             if (outcome != DeductedOrderVerifier.Outcome.ORDER_GONE) {

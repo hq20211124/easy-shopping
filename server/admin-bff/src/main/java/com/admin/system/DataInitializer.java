@@ -75,6 +75,8 @@ public class DataInitializer implements ApplicationRunner {
         save("order:ship", "订单发货", "permission", order.getId(), null, null, 12);
         save("order:close", "订单关单", "permission", order.getId(), null, null, 13);
         save("refund:list", "售后列表", "permission", order.getId(), null, null, 14);
+        // 明文手机号专用权限：列表/详情一律脱敏，仅发货/联系快递场景按需查看（core-order 侧同事务留痕）
+        save("order:mobile:read", "查看收货人明文手机号", "permission", order.getId(), null, null, 15);
         save("system:permission", "权限点管理", "permission", system.getId(), null, null, 11);
         save("system:dept", "部门管理", "permission", system.getId(), null, null, 12);
         save("system:config", "系统配置", "permission", system.getId(), null, null, 13);

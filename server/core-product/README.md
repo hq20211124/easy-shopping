@@ -20,7 +20,7 @@
 | GET | `/api/admin/product/list?keyword=&categoryId=&auditStatus=&shelfStatus=&page=&pageSize=` | 商品分页 | — |
 | GET | `/api/admin/product/{id}` | 详情（SPU+SKU，`costPrice` 仅 `cost:read` 角色可见，否则 null） | — |
 | POST | `/api/admin/product` | 创建商品（**P0：创建即草稿**）| ✅ |
-| PUT | `/api/admin/product/{id}` | 编辑（仅 draft/rejected；SKU 全量替换） | ✅ |
+| PUT | `/api/admin/product/{id}` | 编辑（仅 draft/rejected；**SKU 按 skuId 合并**，见 §5） | ✅ |
 | DELETE | `/api/admin/product/{id}` | 软删除→回收站（auditing 禁删 → 1001） | ✅ |
 | POST | `/api/admin/product/{id}/restore` | 回收站恢复（恢复后强制下架） | ✅ |
 | DELETE | `/api/admin/product/{id}/permanent` | 彻底删除（SPU+SKU 物理删除） | ✅ |
@@ -37,11 +37,12 @@
 ```json
 { "name": "...", "subtitle": "...", "categoryId": 123, "mainImage": "url", "images": "url1,url2",
   "video": "url", "detail": "<p>富文本</p>",
-  "skus": [ { "skuCode": null, "title": null, "spec": {"颜色":"黑","容量":"256GB"},
+  "skus": [ { "skuId": 10001, "skuCode": null, "title": null, "spec": {"颜色":"黑","容量":"256GB"},
               "images": "url", "price": "7999.00", "marketPrice": "8999.00", "costPrice": "7000.00" } ] }
 ```
 - `price/marketPrice` 在创建/编辑时经 HTTP 同步到 core-price（`POST /api/v1/internal/price/skus`，容错降级）。
 - SPU 上的 `minPrice/marketPrice` 仅为**展示冗余**（min=SKU 最低价，market=SKU 划线价最大值）。
+- 编辑时**必须回传 `skuId`**（见 §5）；创建时 `skuId` 一律忽略。
 
 ### 买家端（无鉴权；响应统一信封 `{code,msg,data,traceId}`，字段 camelCase）
 
@@ -96,3 +97,45 @@ draft(0) ──提交──► auditing(1) ──通过──► on_shelf(2)（�
 4. 网关若走 `/api/admin/**` 需确认 gateway 路由表已覆盖（本模块未改 gateway）。
 5. 买家端响应字段为 **camelCase**（骨架信封口径）；ios 侧 snake_case 由 BFF/前端映射。
 6. 配置开关：`app.product.price-client.enabled`（默认 true）——false 时不同步/回填价格（测试用）。
+
+## 5. 商品编辑语义：SKU 按 skuId 合并（P1-2，勿回退成「全量替换」）
+
+> 背景：AUDIT 登记项「⚠️ `PUT /api/admin/product/{id}` 是 SKU 全量替换（skuId 变更会清空 `costPrice`）」——
+> 原实现 `deleteBySpuId` + 全量插入，导致 ① 无 `cost:read` 角色的每次编辑都抹掉成本价
+> （详情接口对无该角色把 `costPrice` 脱敏为 null，前端原样回传即被写库）；
+> ② 每次编辑换新 SKU 雪花 ID → core-price / core-inventory 绑定全部错位；
+> ③ 价格同步靠「行序号 + skuCode 猜测」配对，错配时把 A 的价写到 B 的 skuId 上。
+
+| 入参形态 | 行为 |
+|----------|------|
+| 带 `skuId`（且属于本商品、未软删） | 按该 id **更新既有行**，skuId 保持不变 |
+| 不带 `skuId` | **新增**行（服务端雪花 ID） |
+| `costPrice` / `title` / `skuCode` / `images` 为 null 或空 | **保留库中原值**（缺省 ≠ 清空），只有显式传值才更新 |
+| 库中存在、但本次请求未携带 | **软删除**（`deleted=true`，数据保留可追溯，不物理删以免订单/库存/价格悬空引用） |
+| `skuId` 重复（同一次请求内） | 1001「同一次请求内 skuId 重复: X」 |
+| `skuId` 不存在 / 属于别的商品 / 已软删 | 1001「skuId 不存在或不属于该商品: X」 |
+| `marketPrice < price` | 1001「marketPrice 不能低于 price」（与 core-price 同口径同码） |
+| `costPrice < 0` | 1001「costPrice 不能为负数」 |
+
+- **禁止按行序号匹配**：入参行序与库中行序无关，落库按 `skuId` 精确定位。
+- 价格同步改为「合并结果 ↔ 入参同序配对」，不再依赖 skuCode 猜测。
+- ⚠️ **前端契约同步项**：web-admin `updateProduct` 目前**不回传 skuId**，此时每行按新增处理、
+  成本价与绑定保留能力不生效（等价于旧行为，服务端打 WARN 提示）。前端补传 `skuId` 后本项收益才完全生效。
+
+---
+
+## 审查记录
+
+- **P1-2（AUDIT README 第五节「⚠️ SKU 全量替换」）**：`PUT /api/admin/product/{id}` 由
+  「先删后插的全量替换」改为「按 `skuId` 合并 + 未携带字段保留 + 多余行软删」，§5。
+  根因：① 全量插入把「详情脱敏后的 null」当成真实值写回，抹掉 `costPrice`；
+  ② 每次编辑换新 SKU ID → core-price/core-inventory 绑定错位；
+  ③ 价格同步按行序号 + skuCode 猜测配对，错配会把 A 的价写到 B 的 skuId 上。
+  改动文件：`ProductDtos`（`SkuInput` 增 `skuId` + 保留 7 参兼容构造；新增一致性校验）、
+  `ProductService`（`mergeSkus`/`insertSkus`/`applySkuInput`/`syncPricesToPriceService`）、
+  `SkuRepository`（新增 `findBySpuId` 含软删行）。
+  回归测试：`ProductSkuUpdateSemanticsTest`（9 例：成本价保留 / 显式更新 / 新增行 / skuId 重复 /
+  跨商品 skuId / 行序打乱仍按 id 定位 / marketPrice≥price / costPrice 非负 / 多余行软删）。
+  既有测试未删除任何断言。
+- **前端同步要求（未改 web-admin，由前端负责人处理）**：`updateProduct` 每行必须带上 `skuId`
+  （取自 `GET /api/admin/product/{id}` 的 `skus[].skuId`，详情接口本来就返回该字段）。

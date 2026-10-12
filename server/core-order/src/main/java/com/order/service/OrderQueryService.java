@@ -2,7 +2,9 @@ package com.order.service;
 
 import com.easyshopping.common.api.BizErrorCode;
 import com.easyshopping.common.api.BizException;
+import com.easyshopping.common.api.MaskUtil;
 import com.easyshopping.common.api.PageResult;
+import com.easyshopping.common.id.SnowflakeIdGenerator;
 import com.order.domain.OrderItem;
 import com.order.domain.OrderMain;
 import com.order.domain.OrderStatus;
@@ -11,9 +13,11 @@ import com.order.dto.OrderDtos.ActionView;
 import com.order.dto.OrderDtos.AdminOrderVO;
 import com.order.dto.OrderDtos.AmountDetailView;
 import com.order.dto.OrderDtos.ChildOrderView;
+import com.order.dto.OrderDtos.InternalOrderSnapshot;
 import com.order.dto.OrderDtos.OrderDetailVO;
 import com.order.dto.OrderDtos.OrderItemView;
 import com.order.dto.OrderDtos.OrderListVO;
+import com.order.dto.OrderDtos.ReceiverMobileView;
 import com.order.dto.OrderDtos.TimelineView;
 import com.order.repo.OrderItemRepository;
 import com.order.repo.OrderMainRepository;
@@ -39,8 +43,10 @@ import java.util.stream.Collectors;
  * <p>买家端只可见父单（拆单后子单在详情/管理端展开）；状态 Tab 以服务端下发的
  * status/statusText/actions 为准（android-backend 4.3.4 落地约定 5），前端不自建状态文案表。</p>
  *
- * <p><b>隐私口径</b>：收货人手机号在所有出参统一脱敏（见 {@link #maskMobile}），
- * 管理端列表/详情与买家端列表/详情一律不返回明文。</p>
+ * <p><b>隐私口径</b>：收货人手机号在所有出参统一脱敏（见 {@link #maskMobile}，算法已收敛到
+ * {@code com.easyshopping.common.api.MaskUtil}），管理端列表/详情与买家端列表/详情一律不返回明文；
+ * 管理端确需明文（发货/联系快递）只能走 {@link #receiverMobileForShip} 的
+ * <b>带专门权限码 + 留痕</b>专用接口，禁止批量导出。</p>
  */
 @Service
 public class OrderQueryService {
@@ -49,15 +55,18 @@ public class OrderQueryService {
     private final OrderItemRepository orderItemRepository;
     private final OrderStatusLogRepository orderStatusLogRepository;
     private final OrderLifecycleService lifecycleService;
+    private final SnowflakeIdGenerator idGenerator;
 
     public OrderQueryService(OrderMainRepository orderMainRepository,
                              OrderItemRepository orderItemRepository,
                              OrderStatusLogRepository orderStatusLogRepository,
-                             OrderLifecycleService lifecycleService) {
+                             OrderLifecycleService lifecycleService,
+                             SnowflakeIdGenerator idGenerator) {
         this.orderMainRepository = orderMainRepository;
         this.orderItemRepository = orderItemRepository;
         this.orderStatusLogRepository = orderStatusLogRepository;
         this.lifecycleService = lifecycleService;
+        this.idGenerator = idGenerator;
     }
 
     // ------------------------------------------------------------------ 买家端
@@ -121,15 +130,23 @@ public class OrderQueryService {
     // ------------------------------------------------------------------ 服务间
 
     /**
-     * 订单原始快照（core-payment 预支付取数 / 支付对账用，直连 :8086 的 internal 端点）。
+     * 服务间订单字段快照（core-payment 预支付取数 / 对账用，直连 :8086 的 internal 端点）。
      *
      * <p>不能复用 {@link #buyerDetail}：服务间调用不带 X-User-Id（DEV.md 4.5 内网直连），
      * 走买家接口会被 {@code requireUserId()} 判为 1002。此处只按 orderId 取数，不做身份校验。</p>
+     *
+     * <p><b>只返回显式字段快照，禁止返回 {@link OrderMain} 实体</b>（审计 P1 遗留项）：
+     * 实体整返等于把<b>明文 receiver_mobile / 收货地址 / 备注</b>一并开放给
+     * core-payment、core-promotion（对账）等服务间调用方，而它们并不需要这些字段——
+     * 隐私字段一旦整返，删除成本极高（已被抓包/日志/第三方留存）。</p>
+     *
+     * <p>保留字段与解析口径见 {@link InternalOrderSnapshot}（调用方已消费字段一个不多、一个不少）。</p>
      */
     @Transactional(readOnly = true)
-    public OrderMain internalOrder(Long orderId) {
-        return orderMainRepository.findById(orderId)
+    public InternalOrderSnapshot internalOrder(Long orderId) {
+        OrderMain order = orderMainRepository.findById(orderId)
                 .orElseThrow(() -> new BizException(BizErrorCode.ORDER_NOT_FOUND, "订单不存在: " + orderId));
+        return InternalOrderSnapshot.of(order);
     }
 
     // ------------------------------------------------------------------ 管理端
@@ -173,6 +190,35 @@ public class OrderQueryService {
                 .orElseThrow(() -> new BizException(BizErrorCode.ORDER_NOT_FOUND, "订单不存在: " + orderId)));
     }
 
+    /**
+     * 管理端查看收货人<b>明文</b>手机号（发货 / 联系快递场景；plans 12.6「明文仅在必要场景按需返回」）。
+     *
+     * <p><b>与列表/详情出参的唯一区别</b>：① 必须在管理端专用接口上带专门权限码
+     * {@code order:mobile:read} 调用（校验在 {@code AdminOrderController}，fail-closed）；
+     * ② <b>每次查看写一条操作留痕</b>（订单状态流水 order_status_log，operator=管理端，
+     * reason=「{@link OrderStatusLog#REASON_VIEW_RECEIVER_MOBILE}」），
+     * 满足「谁、何时、看了哪一单」可追溯；③ 返回值只有本单明文，无列表/导出入口。</p>
+     *
+     * <p><b>口径说明</b>：「订单 owner 本人可见明文」属产品未决口径（AGENTS.md 已登记为待确认），
+     * 本类只开放<b>管理端</b>这一条路，且要求权限码 + 留痕；买家端仍一律脱敏
+     * （见 {@link #maskMobile} 注释中的保守口径说明）。</p>
+     *
+     * <p>写留痕因此<b>不是</b> readOnly 事务；若留痕写入失败必须整体失败——留痕失败还把明文发出去，
+     * 等于没有留痕（合规上不可接受）。</p>
+     *
+     * @param orderNo 订单号（对外展示的 24 位编号；不接受雪花 ID，避免与子单/父单歧义）
+     * @param adminId 操作人（管理端用户 ID，为空即失去留痕意义，由调用方先行拦截）
+     * @return 该订单的明文收货人手机号
+     */
+    @Transactional
+    public ReceiverMobileView receiverMobileForShip(String orderNo, Long adminId) {
+        OrderMain order = orderMainRepository.findByOrderNo(orderNo)
+                .orElseThrow(() -> new BizException(BizErrorCode.ORDER_NOT_FOUND, "订单不存在: " + orderNo));
+        // 留痕：复用订单状态流水（不新建表），from==to 表示「无状态变更的操作留痕」
+        orderStatusLogRepository.save(OrderStatusLog.receiverMobileViewed(idGenerator.nextId(), order, adminId));
+        return new ReceiverMobileView(order.getOrderNo(), order.getReceiverMobile());
+    }
+
     // ------------------------------------------------------------------ 组装
 
     /**
@@ -189,17 +235,13 @@ public class OrderQueryService {
      * 若产品确认「本人可见明文」，须先在 plans 12.5/12.6 增补该例外并配套
      * 「仅本人 + 留痕」的专用接口，不能由本类自行开口子（否则管理端/导出链路会跟着漏出明文）。</p>
      *
-     * <p>口径与 core-user 的 {@code MaskUtil.maskMobile} 一致；落库明文（P1 改 AES-256-GCM 密文存储 +
-     * 解密后按本规则脱敏），出参明文由 P1 的带权限专用接口提供。</p>
+     * <p>口径与 core-user 一致；算法已收敛为公共工具 {@link MaskUtil}（审计登记项：
+     * MaskUtil 从 core-user 提到 common）。本方法保留为薄委托，避免既有调用方/用例失效。
+     * 落库明文（P1 改 AES-256-GCM 密文存储 + 解密后按本规则脱敏），
+     * 出参明文仅由 {@link #receiverMobileForShip} 的带权限 + 留痕接口提供。</p>
      */
     public static String maskMobile(String mobile) {
-        if (mobile == null || mobile.isBlank()) {
-            return mobile; // 订单表默认空串，保持原样返回（不转 null，避免前端渲染出 "null"）
-        }
-        if (mobile.length() < 7) {
-            return "****";
-        }
-        return mobile.substring(0, 3) + "****" + mobile.substring(mobile.length() - 4);
+        return MaskUtil.maskMobile(mobile);
     }
 
     private OrderListVO toBuyerListVO(OrderMain parent) {

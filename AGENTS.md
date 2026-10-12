@@ -61,6 +61,21 @@ AGENTS.md         本文件
 - 本机环境：Maven 用全路径 `C:\D\tools\maven\bin\mvn.cmd`；JDK17 在 `C:\Android\jdk-17`；Android SDK 在 `C:\Android`（compileSdk 34）；WSL wslrelay 占用 `::1:8081-8083`，服务一律绑 `127.0.0.1`。
 - 雪花 ID 为偶数序列（序列左移 1bit 防 JS `JSON.parse` 精度丢失），勿改回标准雪花。
 - 后端技术栈 P0 为 H2(MySQL 模式)+内存事件（单机可运行）；生产演进为 MySQL 16库64分片+RabbitMQ（**维持 RabbitMQ 不迁移**，触发条件见总纲），**不做单元化/异地多活/OceanBase/RocketMQ**。
+- **券并发限领必须用悲观锁 + 显式 `READ_COMMITTED`**：条件 UPDATE + 子查询是**虚假原子性**（子查询按语句快照在等锁前求值，16 线程限领 1 曾成功 10 个），勿再尝试；`READ_COMMITTED` 不可省——MySQL 默认 RR 下快照在加锁前固定会失效。
+
+## CI 与验证（本机无 Mac / 无 Docker 的兜底）
+
+`.github/workflows/ci.yml` 6 个 job，`push`/`PR`/`workflow_dispatch` 自动触发：
+
+| Job | 验证内容 |
+|-----|---------|
+| backend | JDK17 `mvn test` + `package`（Linux 上跑，无 GBK 编码坑） |
+| frontend-web | matrix(web-admin / web-buyer) build + lint + test |
+| miniprogram | type-check + build:h5 + build:mp-weixin |
+| android | Gradle 8.4 + SDK34 `assembleDebug`，上传 APK（仓库**无 gradle wrapper**，CI 显式装版本） |
+| **ios-macos** | macOS runner：`xcodegen generate` + `xcodebuild`（签名全关、generic simulator）——**本机无 Xcode，iOS 的唯一真实编译验证手段**；日志与 xcresult `if: always()` 上传，Job Summary 提取前 50 条 `error:` |
+
+**推代码用 SSH**（本机网络下 `github.com:443` 不通，`api.github.com` 通）：`git remote set-url origin git@github.com:<owner>/easy-shopping.git`。查看结果：`gh run list` / `gh run watch <id>`。私有仓库 macOS 额度约 200 分钟/月（`workflow_dispatch` 有 `skip_ios` 开关省额度）。
 
 ## 工作流程约定
 

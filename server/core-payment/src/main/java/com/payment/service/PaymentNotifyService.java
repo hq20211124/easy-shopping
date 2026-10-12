@@ -6,6 +6,7 @@ import com.easyshopping.common.event.DomainEventNames;
 import com.easyshopping.common.event.DomainEventPublisher;
 import com.easyshopping.common.id.SnowflakeIdGenerator;
 import com.payment.client.OrderClient;
+import com.payment.client.OrderSnapshot;
 import com.payment.domain.PaymentNotifyLog;
 import com.payment.domain.PaymentOrder;
 import com.payment.repo.PaymentNotifyLogRepository;
@@ -31,6 +32,12 @@ import java.util.Map;
  *   <li>② 状态 CAS：仅 {@code pending → paid} 允许，已 paid/终态拒绝（SQL 条件更新，并发只成功一次）；</li>
  *   <li>③ 金额校验：通知金额 ≠ 支付单金额 → 告警日志 + BizException，事务回滚（② 的状态翻转一并撤销）。</li>
  * </ol>
+ *
+ * <p><b>第二道防线（③ 之后、入账提交前，P1）</b>：③ 只证明「通知金额 == 支付单金额」，而支付单金额的源头
+ * 是 prepay 时刻反查到的订单 {@code payAmount}。若 prepay 之后订单金额被改（管理端改价、优惠重算），
+ * ③ 会拿着旧支付单金额照常入账，钱与单据不一致且完全静默。故入账前再反查一次订单当前 {@code payAmount}
+ * 与支付单金额比对：<b>不一致 → ERROR 告警 + 拒绝入账</b>（让不一致暴露，而不是静默入账）；
+ * <b>反查失败/超时 → 仅告警放行</b>（见 {@link #verifyOrderPayAmount} 的权衡说明）。</p>
  *
  * <p><b>为什么 ① 只判 PROCESSED（P1-1 修复）</b>：① 的日志先独立提交（否则与 ②③ 同事务回滚后
  * 连「已处理」都记不住）。若 ① 对所有已存在的行一律判重，则 ③ 失败回滚后，渠道按标准语义用
@@ -87,12 +94,12 @@ public class PaymentNotifyService {
             return NotifyOutcome.repeated();
         }
 
-        // ② 状态 CAS + ③ 金额校验（同一本地事务：金额不符 → 异常回滚，② 的状态翻转一并撤销）
+        // ② 状态 CAS + ③ 金额校验 + ④ 反查订单应付金额（同一本地事务：不符 → 异常回滚，② 的状态翻转一并撤销）
         NotifyOutcome outcome;
         try {
             outcome = transactionTemplate.execute(s -> casAndVerify(cmd));
         } catch (RuntimeException e) {
-            // ②③ 失败：把该 notify_id 标记为 REJECTED，使渠道按标准语义用同一 notifyId
+            // ②③④ 失败：把该 notify_id 标记为 REJECTED，使渠道按标准语义用同一 notifyId
             // 修正后重投能被处理（否则钱已收但支付单永远停在 pending，无自动恢复路径）
             markRejected(cmd.notifyId());
             throw e;
@@ -186,7 +193,7 @@ public class PaymentNotifyService {
         return notifyLog;
     }
 
-    /** ② 状态 CAS + ③ 金额校验（在事务内执行）。 */
+    /** ② 状态 CAS + ③ 金额校验 + ④ 反查订单应付金额（在事务内执行，④ 的依赖抖动放行不阻断）。 */
     private NotifyOutcome casAndVerify(NotifyCommand cmd) {
         PaymentOrder payment = paymentRepo.findById(cmd.paymentId())
                 .orElseThrow(() -> new BizException(BizErrorCode.PAYMENT_FAILED,
@@ -215,7 +222,53 @@ public class PaymentNotifyService {
                     payment.getId(), payment.getOrderId(), cmd.amount(), payment.getAmount(), cmd.notifyId());
             throw new BizException(BizErrorCode.PAYMENT_FAILED, "支付回调金额与支付单不一致");
         }
+
+        // ④ 第二道防线：反查订单当前应付金额再比对一次（防止 prepay 之后订单被改价仍按旧金额静默入账）
+        verifyOrderPayAmount(payment, cmd);
         return NotifyOutcome.firstPaid();
+    }
+
+    /**
+     * 第二道防线：反查订单当前 {@code payAmount} 与支付单金额二次比对。
+     *
+     * <p><b>为什么必须做</b>：③ 的比对基准是「支付单金额」，而支付单金额来自 prepay 时刻的订单快照。
+     * prepay 之后若订单被改价（管理端改价、优惠重算等），③ 会用旧金额照常入账——钱与单据不一致却完全静默，
+     * 直到对账才发现。</p>
+     *
+     * <p><b>性能与可用性权衡（勿改成「失败即拒绝」）</b>：这里是一次同步 HTTP，回调是热路径，
+     * 订单服务抖动会直接放大成「入账失败」。两个方向的错误代价极不对称：
+     * <ul>
+     *   <li>因订单服务抖动拒绝入账 → <b>用户已扣款但系统显示未支付</b>（真实资损 + 客诉 + 需批量补单）；</li>
+     *   <li>漏掉一次比对 → 异常场景靠人工对账/告警兜底（金额漂移本身已是上游问题，不是本层引入的）。</li>
+     * </ul>
+     * 因此口径是：<b>反查失败/超时 → 只告警放行</b>（沿用本类既有语义「支付事实已成立、对账兜底」，
+     * 与 {@link #notifyOrderAndPublish} 中订单通知失败不回滚一致）；
+     * <b>反查成功且金额不一致 → 告警 + 拒绝入账</b>，让钱与单据不一致暴露出来而不是静默沉淀。
+     * 另：④ 只在 ② 的 {@code pending → paid} 真实翻转分支里执行，重复通知不重复反查。</p>
+     */
+    private void verifyOrderPayAmount(PaymentOrder payment, NotifyCommand cmd) {
+        OrderSnapshot order;
+        try {
+            order = orderClient.getOrder(payment.getOrderId());
+        } catch (Exception e) {
+            log.warn("[支付告警] 反查订单应付金额失败，放行入账（钱已收，不因依赖抖动拒绝）"
+                            + " paymentId={} orderId={} 支付单金额={} notifyId={} err={}",
+                    payment.getId(), payment.getOrderId(), payment.getAmount(), cmd.notifyId(), e.toString());
+            return;
+        }
+        if (order == null || order.payAmount() == null) {
+            log.warn("[支付告警] 反查订单应付金额缺少 payAmount，放行入账（待人工/对账核实）"
+                            + " paymentId={} orderId={} 支付单金额={} notifyId={}",
+                    payment.getId(), payment.getOrderId(), payment.getAmount(), cmd.notifyId());
+            return;
+        }
+        if (payment.getAmount().compareTo(order.payAmount()) != 0) {
+            log.error("[支付告警] 支付单金额与订单当前应付金额不一致（疑似 prepay 后改价），拒绝入账"
+                            + " paymentId={} orderId={} 支付单金额={} 订单应付={} 通知金额={} orderStatus={} notifyId={}",
+                    payment.getId(), payment.getOrderId(), payment.getAmount(), order.payAmount(),
+                    cmd.amount(), order.status(), cmd.notifyId());
+            throw new BizException(BizErrorCode.PAYMENT_FAILED, "支付回调金额与订单应付金额不一致");
+        }
     }
 
     private void notifyOrderAndPublish(Long paymentId) {

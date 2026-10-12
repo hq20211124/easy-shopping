@@ -62,18 +62,35 @@
 2. **静默失败是放大器**：F1~F3 被 `try?` 吞掉表现为"点了没反应"；iOS 结算页券不可用时静默按原价下单。→ 解码失败一律上抛到 UI（输出**字段路径+期望类型**）；选了券但试算失败改为**阻断式确认**。
 3. **文档与代码偏离未登记**：F5（声称已隐藏实则未隐藏）、B3（尾差归集对象与 plans 原文不符）、B6（退款 TODO 注释路径与真实接口不符）、web-admin README 声称"lint 通过"实则长期为红。→ 契约表整表重建（每行标注复核方式与后端文件:行号），未核对的标注不得进文档。
 
-## 五、遗留与后续（已登记，非本次必修）
+## 五、遗留与后续（审计登记项的补齐状态）
 
-**行为变更（需知晓）**：幂等语义改为"业务失败不占用幂等键，同键可重试；系统异常仍占用"；券 deduct/release 买家端强制归属校验（internal 端点需 `X-Internal-Token`，**默认空=拒绝全部**）；密码升级 PBKDF2（存量用户登录时自动迁移）。
+**全部 P1 已补齐**（CI 全绿验证），仅剩需项目组决策或 P1 迭代的条目：
 
-**发布约束**：`core-payment` 强依赖 core-order 返回 `payAmount`——**灰度必须 core-order 先于 core-payment 上线**（否则 prepay fail-closed 报 9999，不会多收费但不可用）。
+### 已补齐（2026-10-12 第二轮）
 
-**P1 待办（审计已列，未修）**：
-- 后端：inventory/coupon 缺对账任务之外的跨域一致性校验；`internalOrder` 返回整实体（含明文手机号）应收窄为字段快照；管理端需"带权限+查看留痕"的明文手机号专用接口；每人限领"先查后写"并发超发；支付回调"反查订单 payAmount 二次比对"作为第二道防线。
-- 后端缺口（前端已诚实下线/占位）：售后域 6 端点、订单备注接口、`AdminOrderVO` 缺字段、`AdminDataController` 工作台为 stub。
-- ⚠️ **需书面确认后才可放开**：`PUT /api/admin/product/{id}` 是 SKU **全量替换**（skuId 变更会清空 `costPrice`），放开商品编辑入口前须确认。
-- 口径待定：若产品要求"订单 owner 本人可见明文手机号"，须先改 plans 12.5/12.6 再开专用留痕接口。
-- 工程：`MaskUtil` 应从 core-user 提到 common（core-order 现为同算法副本）；`start-all.ps1` 冷启动探测超时已由 3s 放宽至 10s（11 JVM 同启会吃满 CPU，过短超时会把"还在启动"误判为"起不来"）。
+| 项 | 内容 |
+|----|------|
+| 管理端明文手机号 | `GET /api/admin/orders/{orderNo}/receiver-mobile`——三重闸门（管理端角色 + 专门权限码 `order:mobile:read` **fail-closed** + 操作人非空），同事务写操作留痕（复用 `order_status_log`，不新建表）；列表/详情仍脱敏 |
+| internal 接口收窄 | `internalOrder` 由返回整个 `OrderMain` 实体改为 **6 字段快照**（orderId/userId/totalAmount/payAmount/status/payDeadline，按 grep 实测的消费方确定）；**明文手机号/姓名/地址/remark/couponId 等一律不再外泄**给 core-payment 与 core-promotion |
+| MaskUtil 提取 | `common/api/MaskUtil.java`（core-user 原副本保留，待统一） |
+| 每人限领并发超发 | 「先查后写」改为**悲观临界区**（`SELECT ... FOR UPDATE` + 显式 `READ_COMMITTED`——RR 下事务快照在加锁前固定会失效）；并发测试 16~24 线程证明「限领 N 则恰成功 N」。⚠️ **条件 UPDATE + 子查询的写法实测无效**（子查询按语句快照在等锁前求值，16 线程限领 1 成功 10 个），代码与 README 已标注"勿再尝试" |
+| 券回收兜底加固 | 越界状态码（如 99）判 `UNKNOWN` 而非 `ORDER_ALIVE`；`used_order_id` 为空的脏数据改为 WARN 留痕；9 例 fail-safe 矩阵测试 |
+| SKU 更新语义 | `PUT /api/admin/product/{id}` 由「先删后插」改为**按 skuId 合并**：带 skuId 按 id 更新（**id 稳定，价格/库存绑定不再错位**），不带则新增；`costPrice` 等字段**未携带即保留库中原值**（无 `cost:read` 角色的编辑不再抹成本价）；未携带的既有 SKU 软删留痕；校验 skuId 重复/跨商品/软删、`marketPrice≥price`、`costPrice≥0` |
+| 支付回调第二道防线 | 反查订单 `payAmount` 与支付单金额比对：一致→入账；**不一致→拒绝 + 告警**（notify_log 标 REJECTED，修正后同 notifyId 可重投）；**反查失败/超时→放行入账**——两个方向的错误代价不对称，因抖动拒绝会造成"用户已扣款显示未支付"的真实资损 |
+| iOS 编译验证 | 建立 GitHub Actions CI（6 job），macOS runner 首次编译即抓出 `TokenKeys` 未定义（`@MainActor` 重构遗漏），修复后 **xcodebuild 成功** |
+
+### 仍需项目组决策
+
+- ⚠️ **放开商品编辑入口前须书面确认**：`PUT /api/admin/product/{id}` 现在是"提交即完整 SKU 列表"，漏行 = 该 SKU 软删（web-admin 需先回传 `skuId`，见 core-product README 的前端同步清单）
+- **订单 owner 是否可见明文手机号**：现按 plans 12.5/12.6 保守口径一律脱敏；若产品要求本人可见明文，须先改 plans 再开"仅本人 + 留痕"的专用接口（不得直接放开现有接口）
+- 券有效期取模板 `endTime` 快照 = **产品口径**（改期不追溯存量券），已写入代码与 README
+- 券模板行热点（同一热门券串行）：彻底消除需 P1 上分桶或独立计数表（计数表须先在 plans DDL 登记）
+
+### P1 迭代项（已登记，未做）
+
+- 后端：`internalOrder` 快照已收窄，但落库手机号仍为明文（建议 AES-256-GCM，P1）；支付回调"反查失败"分支需接告警通道观测其静默失效；每人限领的分桶优化；`core-user` 侧 `MaskUtil` 与 common 版统一
+- 后端缺口（前端已诚实下线/占位）：售后域 6 端点、订单备注接口、`AdminOrderVO` 缺字段、`AdminDataController` 工作台为 stub
+- 工程：`start-all.ps1` 冷启动探测超时已由 3s 放宽至 10s（11 JVM 同启会吃满 CPU，过短超时会把"还在启动"误判为"起不来"）
 
 ## 六、审计方法与可信度（未能验证的部分如实标注）
 

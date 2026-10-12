@@ -15,6 +15,9 @@ public interface CouponRecordRepository extends JpaRepository<CouponRecord, Long
     /** 每人限领计数（同一模板下该用户已领张数，含已用/已过期）。 */
     long countByCouponIdAndUserId(Long couponId, Long userId);
 
+    /** 某用户在某模板下的全部券记录（走 idx_coupon_user，限领断言/对账用）。 */
+    List<CouponRecord> findByCouponIdAndUserId(Long couponId, Long userId);
+
     List<CouponRecord> findByCouponId(Long couponId);
 
     List<CouponRecord> findByUserIdOrderByReceivedAtDesc(Long userId);

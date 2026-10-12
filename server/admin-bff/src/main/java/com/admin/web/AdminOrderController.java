@@ -59,4 +59,18 @@ public class AdminOrderController {
                                      @RequestBody(required = false) Map<String, Object> body) {
         return ApiResponse.ok(coreOrderClient.close(id, body));
     }
+
+    /**
+     * 查看收货人明文手机号（发货 / 联系快递场景）。
+     *
+     * <p>订单列表与详情一律脱敏（plans 12.5/12.6），明文只走这个专用接口：
+     * 需 {@code order:mobile:read} 权限，且 core-order 侧同事务写操作留痕。
+     * 按 <b>orderNo</b> 定位而非雪花 id（拆单后父子单 id 语义易混）。</p>
+     */
+    @GetMapping({"/api/admin/order/{orderNo}/receiver-mobile", "/api/admin/orders/{orderNo}/receiver-mobile"})
+    @RequirePerm("order:mobile:read")
+    @OperationLog(module = "order", action = "查看收货人明文手机号")
+    public ApiResponse<Object> receiverMobile(@PathVariable String orderNo) {
+        return ApiResponse.ok(coreOrderClient.receiverMobile(orderNo));
+    }
 }

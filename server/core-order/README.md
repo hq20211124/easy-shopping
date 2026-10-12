@@ -28,17 +28,36 @@
 | GET | `/api/admin/order/{orderId}`（别名 `/api/admin/orders/{orderId}`） | 订单详情 |
 | POST | `/api/admin/order/{orderId}/ship`（别名 `/api/admin/orders/.../ship`） | 发货（重复发货幂等空操作） |
 | POST | `/api/admin/order/{orderId}/close`（别名 `/api/admin/orders/.../close`） | 手工关单（待付款→已取消；已支付待发货→已关闭+退款；已发货→拒绝） |
+| GET | `/api/admin/order/{orderNo}/receiver-mobile`（别名 `/api/admin/orders/{orderNo}/receiver-mobile`） | **明文手机号专用接口**（发货/联系快递）：需权限码 `order:mobile:read` + 操作人身份，**每次查看写一条操作留痕**；仅返回本单明文，无批量/导出入口 |
+
+> **明文接口契约**（审计 P1 遗留项落地）：
+> ① 权限码 `order:mobile:read` 由 admin-bff RBAC 侧注册同名权限点，校验通过后经
+> `X-Admin-Perms`（英文逗号分隔的权限码集合）透传给 core-order 做**二次校验**
+> （plans/admin-backend 2.3.2「双重校验」；**缺头即拒绝 1004**，不适用「空角色头=内网放行」的 P0 口径）；
+> ② `X-User-Id` 必须非空（无操作人即无法留痕 → 1002）；
+> ③ 留痕复用 `order_status_log`（`from == to` 表示无状态变更的操作留痕，
+> `reason = "查看收货人明文手机号"`，`operator_type = 2` 管理端）；
+> ④ 按 **orderNo**（24 位）而非雪花 ID 定位，避免父子单歧义。
+> 已知副作用：买家端 timeline 与状态流水同源，用户会看到这条商家侧查看动作（透明化提示；如需隐藏须在买家 timeline 过滤）。
 
 ### 1.3 内部跨服务
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/api/v1/internal/orders/{orderId}/paid` | core-payment 支付成功回调；幂等（重复回调 `ALREADY_PAID`），与超时关单并发时 version CAS 裁决 |
-| GET | `/api/v1/internal/orders/{orderId}` | 订单原始快照（core-payment prepay 取额 / 对账）。**定额口径 = `payAmount`（应付）；`totalAmount`（优惠前）仅供参考** |
+| GET | `/api/v1/internal/orders/{orderId}` | 订单**字段快照**（core-payment prepay 取额 / core-promotion 券回收对账）。**定额口径 = `payAmount`（应付）；`totalAmount`（优惠前）仅供参考** |
 
-> **隐私口径**：买家端与管理端的订单出参中 `receiverMobile` 一律脱敏（`138****0000`，与 core-user `MaskUtil` 同口径，
-> 依据 plans ios-backend 12.5/12.6 与 admin-backend 4.4.3）。明文不出服务，
-> P1 补「带权限 + 查看留痕」的专用接口供发货/联系场景按需取。
+> **internal 快照字段集（收窄后）**：仅 `orderId / userId / totalAmount / payAmount / status / payDeadline`
+> 6 个字段，每个字段都对应一个已知消费方（core-payment `RestOrderClient#toSnapshot`、
+> core-promotion `RestDeductedOrderVerifier`）。**不返回** `receiverMobile` / `receiverName` /
+> `receiverAddress` / `remark`（收货个人信息，服务间调用方一个都不消费）与 `couponId` / `payType` /
+> `version` 等无消费方字段（审计 P1：原 `OrderQueryService.internalOrder` 返回整个 `OrderMain` 实体）。
+> **字段名不得增删**——core-payment 按 `orderId`/`payAmount` 取值，改名即导致 prepay fail-closed（9999）。
+
+> **隐私口径**：买家端与管理端的订单出参中 `receiverMobile` 一律脱敏（`138****0000`），
+> 脱敏算法取自公共工具 `com.easyshopping.common.api.MaskUtil`（plans ios-backend 12.5/12.6 与
+> admin-backend 4.4.3）；明文只从 1.2 节的「带权限 + 查看留痕」专用接口出，且**不得批量导出**。
+> 「订单 owner 本人可见明文」仍是产品未决口径（AGENTS.md 登记待确认），本模块**未开口子**。
 
 ## 2. 状态机（0 基 8 值，AGENTS.md 唯一事实来源）
 
@@ -133,7 +152,9 @@ app:
 | `OrderStateMachineCasTest`（3） | **CAS 败方三条路径**：重读已被并发方推进→正常提交、重读非目标态→整体回滚、CAS 假成功→组内一致性断言拦截 |
 | `OrderCreateSplitTest`（5） | 多店铺拆单、优惠比例分摊 + 尾差归集到金额最大子单（Σ恒等）、`order_no` 24 位、预占联动 |
 | `DiscountAllocatorTest`（12） | 分摊器不变式：尾差落最大基数、并列取首个、Σ恒等、空/负基数拒绝 |
-| `OrderPrivacyMaskTest`（5） | 收货人手机号脱敏：买家详情 / 管理端列表 / 管理端详情 / 落库明文 / 脱敏规则边界 |
+| `OrderPrivacyMaskTest`（5） | 收货人手机号脱敏：买家详情 / 管理端列表 / 管理端详情 / 落库明文 / 脱敏规则边界（断言经 common `MaskUtil`） |
+| `OrderAdminReceiverMobileTest`（11） | **明文专用接口**：有权返回明文 + 写留痕（订单号/操作人/事由/from==to）、无权限码 403/1004、不含本码 403、空白码 403、买家角色 403、无操作人 401/1002、订单不存在 4001、每次查看累计留痕、返回体无批量结构、其它出参仍脱敏、留痕不改状态不发事件 |
+| `OrderInternalSnapshotTest`（7） | **快照字段收窄**：字段集恰好 6 个、无明文手机号/姓名/地址/remark/couponId、按 core-payment 解析口径取额（pay=90≠total=100）、core-promotion 口径 status 为数字、订单不存在 4001 |
 | `OrderIdempotencyTest`（3） | **场景④** 同键 409/1005 只建一笔、缺键 1001、键作用域按 METHOD:URI 隔离 |
 | `OrderTimeoutCloseTest`（4） | **场景②** 超时扫描 → 6 已取消 + 释放库存 + 事件；未到期不关 |
 | `OrderRaceTest`（3） | **场景⑥** 关单 vs 支付回调：确定性两向 + 并发 latch 终态裁决 |
@@ -151,3 +172,9 @@ app:
 - `order_main.coupon_id` 依赖下单侧落库（`OrderCreateService`）；未落库的存量订单退券安全跳过；
 - 物流单号未落 logistics 服务（TODO P1）；
 - `order.shipped` / `order.completed` 事件名待注册表登记。
+
+## 10. 审查记录
+
+| 时间 | 内容 |
+|------|------|
+| 2026-10-12 | **审计 P1 遗留项**（本次）：① 新增管理端明文手机号专用接口（权限码 + 留痕，见 1.2）；② internal 订单快照收窄为显式字段 DTO（见 1.3），`internalOrder` 不再返回 `OrderMain` 实体；③ 脱敏算法改用公共工具 `common/api/MaskUtil`（本模块 `maskMobile` 保留为薄委托，既有用例零改动）。新增 `OrderAdminReceiverMobileTest`(11) / `OrderInternalSnapshotTest`(7)；`mvn -o -q -pl common,core-order test` 全绿（common 17 / core-order 99），core-payment 12 项回归全绿（未改其任何代码） |

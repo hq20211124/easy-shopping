@@ -24,6 +24,8 @@ import java.util.Map;
 public class CoreOrderClient {
 
     private static final String SERVICE = "core-order";
+    /** 查看收货人明文手机号的权限码（core-order 的 X-Admin-Perms 头按此 fail-closed 校验）。 */
+    private static final String PERM_VIEW_RECEIVER_MOBILE = "order:mobile:read";
     private static final ParameterizedTypeReference<ApiResponse<Object>> OBJECT_TYPE =
             new ParameterizedTypeReference<>() {
             };
@@ -69,6 +71,25 @@ public class CoreOrderClient {
             return RemoteSupport.unwrap(restClient.post()
                     .uri("/api/admin/order/{id}/close", id)
                     .body(body == null ? Map.of() : body)
+                    .retrieve().body(OBJECT_TYPE), SERVICE);
+        } catch (RuntimeException e) {
+            throw RemoteSupport.translate(e, SERVICE);
+        }
+    }
+
+    /**
+     * 查看收货人<b>明文</b>手机号（GET /api/admin/order/{orderNo}/receiver-mobile）。
+     *
+     * <p>core-order 侧 fail-closed：必须带 {@code X-Admin-Perms} 头且包含
+     * {@code order:mobile:read} 才返回明文（明文 PII 不能靠「没带头」默认放行）。
+     * 浏览器请求不带这个头，因此由本 BFF 在鉴权通过后显式注入——本方法只应被
+     * 带 {@code @RequirePerm("order:mobile:read")} 的端点调用。</p>
+     */
+    public Object receiverMobile(String orderNo) {
+        try {
+            return RemoteSupport.unwrap(restClient.get()
+                    .uri("/api/admin/order/{orderNo}/receiver-mobile", orderNo)
+                    .header("X-Admin-Perms", PERM_VIEW_RECEIVER_MOBILE)
                     .retrieve().body(OBJECT_TYPE), SERVICE);
         } catch (RuntimeException e) {
             throw RemoteSupport.translate(e, SERVICE);

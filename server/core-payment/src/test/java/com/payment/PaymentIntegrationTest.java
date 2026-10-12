@@ -27,6 +27,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.web.client.ResourceAccessException;
 
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
@@ -53,7 +54,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  *
  * <p>覆盖任务要求：① 同一 notify 重复 10 次只生效 1 次 ② 金额不符拒绝 ⑤ 退款幂等
  * ⑥ prepay 忽略客户端金额字段（防改价 C7）且取<b>应付金额</b>而非商品总额（P0-1），
- * 另覆盖 mock 支付同链路、对账兜底、金额不符后<b>同 notifyId</b> 重投可恢复（P1-1）。</p>
+ * 另覆盖 mock 支付同链路、对账兜底、金额不符后<b>同 notifyId</b> 重投可恢复（P1-1），
+ * 以及回调第二道防线（P1）：入账前反查订单 payAmount —— 一致则入账、不一致拒绝、
+ * <b>反查失败/超时仍然入账</b>（依赖抖动不得阻断入账，钱已收）。</p>
  */
 @SpringBootTest(properties = {
         "spring.datasource.url=jdbc:h2:mem:core-payment-test;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE;DB_CLOSE_DELAY=-1",
@@ -246,6 +249,101 @@ class PaymentIntegrationTest {
                 .andExpect(jsonPath("$.data.result").value("DUPLICATE"));
         verify(orderClient, times(1)).markPaid(eq(100L), eq(paymentId), any());
         assertEquals(1, events.count(DomainEventNames.PAYMENT_SUCCESS));
+    }
+
+    // ---------- ④ 第二道防线：入账前反查订单应付金额（P1） ----------
+
+    /**
+     * 基线：订单应付金额与支付单一致 → 正常入账（第二道防线不得误伤正常链路）。
+     */
+    @Test
+    void notifyWithMatchingOrderPayAmountPays() throws Exception {
+        long paymentId = prepay(100L, 2);
+        notify("{\"notifyId\":\"N-OK-AMT\",\"paymentId\":" + paymentId
+                + ",\"amount\":199.00,\"thirdPartyNo\":\"T-OK-AMT\"}");
+
+        assertEquals(PaymentOrder.STATUS_PAID, paymentRepo.findById(paymentId).orElseThrow().getStatus());
+        // ④ 必须真的反查了订单（而不是只在金额不符时才查）
+        verify(orderClient, times(2)).getOrder(100L); // 1 次 prepay + 1 次入账前反查
+        verify(orderClient, times(1)).markPaid(eq(100L), eq(paymentId), any());
+        assertEquals(1, events.count(DomainEventNames.PAYMENT_SUCCESS));
+    }
+
+    /**
+     * prepay 之后订单被改价（管理端改价/优惠重算）→ 入账前反查发现支付单金额 ≠ 订单应付金额 →
+     * <b>拒绝入账 + ERROR 告警</b>，钱与单据的不一致必须暴露而不是静默沉淀。
+     */
+    @Test
+    void notifyRejectedWhenOrderPayAmountChangedAfterPrepay() throws Exception {
+        long paymentId = prepay(100L, 2); // 落支付单 199.00
+        // prepay 之后订单应付被改成 99.00（渠道按 199.00 扣了钱）
+        stubOrder(100L, "199.00", "99.00", 0);
+
+        mockMvc.perform(post("/api/v1/payment/notify").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"notifyId\":\"N-PRICE\",\"paymentId\":" + paymentId
+                                + ",\"amount\":199.00,\"thirdPartyNo\":\"T-PRICE\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(5001));
+
+        assertEquals(PaymentOrder.STATUS_PENDING,
+                paymentRepo.findById(paymentId).orElseThrow().getStatus(), "订单金额漂移必须拒绝入账且状态不翻转");
+        verify(orderClient, Mockito.never()).markPaid(any(), any(), any());
+        assertEquals(0, events.count(DomainEventNames.PAYMENT_SUCCESS), "拒绝入账不得发 payment.success");
+        assertEquals(PaymentNotifyLog.STATUS_REJECTED,
+                notifyLogRepo.findByNotifyId("N-PRICE").orElseThrow().getProcessStatus(),
+                "拒绝后必须置 REJECTED，订单金额修好后同 notifyId 重投可恢复");
+
+        // 订单金额修回 199.00 后用同一 notifyId 重投 → 正常入账（有自动恢复路径）
+        stubOrder(100L, "199.00", 0);
+        mockMvc.perform(post("/api/v1/payment/notify").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"notifyId\":\"N-PRICE\",\"paymentId\":" + paymentId
+                                + ",\"amount\":199.00,\"thirdPartyNo\":\"T-PRICE\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data.result").value("SUCCESS"));
+        assertEquals(PaymentOrder.STATUS_PAID, paymentRepo.findById(paymentId).orElseThrow().getStatus());
+    }
+
+    /**
+     * <b>关键回归网</b>：反查订单失败/超时<b>不得回滚入账</b>。
+     *
+     * <p>钱已经被渠道收了 —— 若因订单服务抖动拒绝入账，用户会看到「已扣款但订单未支付」，
+     * 这是比漏掉一次金额比对严重得多的资损。故：依赖不可用 → 只告警放行（沿用本类
+     * 「支付事实已成立、对账兜底」的既有语义）。</p>
+     */
+    @Test
+    void notifyStillPaysWhenOrderPayAmountLookupFails() throws Exception {
+        // 场景一：订单服务返回错误（RestClient 不可用 → BizException SYSTEM_ERROR）
+        long paymentId = prepay(100L, 2);
+        doThrow(new BizException(BizErrorCode.SYSTEM_ERROR, "订单服务不可用")).when(orderClient).getOrder(100L);
+
+        mockMvc.perform(post("/api/v1/payment/notify").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"notifyId\":\"N-DOWN\",\"paymentId\":" + paymentId
+                                + ",\"amount\":199.00,\"thirdPartyNo\":\"T-DOWN\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data.result").value("SUCCESS"));
+
+        assertEquals(PaymentOrder.STATUS_PAID,
+                paymentRepo.findById(paymentId).orElseThrow().getStatus(), "反查失败不得回滚入账（钱已收）");
+        verify(orderClient, times(1)).markPaid(eq(100L), eq(paymentId), any());
+        assertEquals(1, events.count(DomainEventNames.PAYMENT_SUCCESS));
+
+        // 场景二：读超时（RestClient 抛 ResourceAccessException）→ 同样放行入账
+        stubOrder(101L, "50.00", 0);
+        long paymentId2 = prepay(101L, 2);
+        doThrow(new ResourceAccessException("Read timed out")).when(orderClient).getOrder(101L);
+
+        mockMvc.perform(post("/api/v1/payment/notify").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"notifyId\":\"N-TIMEOUT\",\"paymentId\":" + paymentId2
+                                + ",\"amount\":50.00,\"thirdPartyNo\":\"T-TIMEOUT\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data.result").value("SUCCESS"));
+
+        assertEquals(PaymentOrder.STATUS_PAID,
+                paymentRepo.findById(paymentId2).orElseThrow().getStatus(), "反查超时不得回滚入账（钱已收）");
+        verify(orderClient, times(1)).markPaid(eq(101L), eq(paymentId2), any());
     }
 
     // ---------- mock 支付走与真实回调相同处理链 ----------

@@ -131,14 +131,27 @@ public class ProductService {
         spu.setAuditStatus(AuditStatus.DRAFT.getValue());
         spu.setShelfStatus(ShelfStatus.OFF_SHELF.getValue());
         spu = spuRepo.save(spu);
-        saveSkus(spu, in.skus());
-        syncPricesToPriceService(spu, in.skus());
+        // 创建：全部按新增处理（忽略入参 skuId，服务端雪花 ID 唯一归属）
+        List<Sku> created = insertSkus(spu, in.skus());
+        syncPricesToPriceService(created, in.skus());
         publishAfterCommit(DomainEventNames.PRODUCT_CREATED,
                 Map.of("spuId", spu.getId(), "categoryId", spu.getCategoryId(), "changeType", "create"));
         return spu;
     }
 
-    /** 编辑商品（PUT /api/admin/product/{id}）：仅 draft/rejected 可编辑（admin-backend 3.3.2 流转图）。 */
+    /**
+     * 编辑商品（PUT /api/admin/product/{id}）：仅 draft/rejected 可编辑（admin-backend 3.3.2 流转图）。
+     *
+     * <p><b>SKU 合并语义（P1-2，勿回退成「先删后插」的全量替换）</b>：</p>
+     * <ul>
+     *   <li>入参带 {@code skuId} → 按该 id <b>更新既有 SKU 行</b>（skuId 保持不变，core-price/core-inventory
+     *       的既有绑定不会错位）；不带 skuId → 新增行。<b>绝不按行序号匹配</b>。</li>
+     *   <li>{@code costPrice} 等成本字段<b>未携带即保留库中原值</b>（管理端详情对无 cost:read 的角色脱敏为 null，
+     *       全量替换会让这类角色的每次编辑都抹掉成本价）。</li>
+     *   <li>请求未携带的既有 SKU 软删除（数据保留可追溯）；skuId 不属于本商品 → 直接拒绝，
+     *       杜绝「拿别的 SKU 的 id 来覆盖」。</li>
+     * </ul>
+     */
     @Transactional
     public Spu update(Long id, ProductInput in) {
         Spu spu = mustGet(id);
@@ -151,11 +164,9 @@ public class ProductService {
         requireCategoryExists(in.categoryId());
         applySpuInput(spu, in);
         spu = spuRepo.save(spu);
-        // P0 简化：SKU 全量替换（先删后插；价格随新 SKU 重新同步到 core-price）
-        skuRepo.deleteBySpuId(id);
-        skuRepo.flush();
-        saveSkus(spu, in.skus());
-        syncPricesToPriceService(spu, in.skus());
+        // 按 skuId 合并（保持 skuId 稳定）+ 未携带的既有 SKU 软删；价格随合并结果同步到 core-price
+        List<Sku> merged = mergeSkus(spu, in.skus());
+        syncPricesToPriceService(merged, in.skus());
         publishAfterCommit(DomainEventNames.PRODUCT_UPDATED,
                 Map.of("spuId", spu.getId(), "changeType", "update"));
         return spu;
@@ -474,21 +485,114 @@ public class ProductService {
         spu.setMarketPrice(market);
     }
 
-    private void saveSkus(Spu spu, List<SkuInput> inputs) {
+    /** 创建路径：全部按新增行落库（入参 skuId 一律忽略，服务端雪花 ID 唯一归属）。 */
+    private List<Sku> insertSkus(Spu spu, List<SkuInput> inputs) {
+        List<Sku> result = new ArrayList<>(inputs.size());
         for (SkuInput in : inputs) {
             Sku sku = new Sku();
             sku.setId(idGenerator.nextId());
             sku.setSpuId(spu.getId());
-            sku.setSkuCode(in.skuCode() == null || in.skuCode().isBlank()
-                    ? "sku-" + idGenerator.nextId() : in.skuCode().trim());
-            sku.setTitle(in.title() == null || in.title().isBlank()
-                    ? spu.getName() + " " + summarizeSpec(in.spec()) : in.title().trim());
-            sku.setSpec(toJson(in.spec()));
-            sku.setImages(in.images() != null ? in.images() : spu.getMainImage());
-            sku.setCostPrice(in.costPrice());
-            sku.setStatus(spu.getShelfStatus()); // 新建 SKU 随 SPU 当前上下架状态
-            skuRepo.save(sku);
+            applySkuInput(spu, sku, in, true);
+            result.add(skuRepo.save(sku));
         }
+        return result;
+    }
+
+    /**
+     * 编辑路径：按 {@code skuId} 合并（新增 / 更新既有行），库中存在但请求未携带的 SKU 软删除。
+     *
+     * <p><b>返回值与 {@code inputs} 严格同序等长</b> —— {@link #syncPricesToPriceService} 依赖该不变式，
+     * 保证「入参第 i 行 ↔ 落库第 i 行」一一对应（不再依赖 skuCode 猜测或行序号错配）。</p>
+     */
+    private List<Sku> mergeSkus(Spu spu, List<SkuInput> inputs) {
+        Map<Long, Sku> owned = new HashMap<>();
+        for (Sku s : skuRepo.findBySpuId(spu.getId())) {
+            owned.put(s.getId(), s);
+        }
+        if (owned.isEmpty()) {
+            return insertSkus(spu, inputs);
+        }
+        if (inputs.stream().noneMatch(in -> in.skuId() != null)) {
+            // 过渡期提示：web-admin updateProduct 尚未回传 skuId（审计 P1-2 前端同步项），
+            // 此时每行都会被当作新增 → 成本价/价格/库存绑定无法保留，功能上等价于旧的全量替换。
+            log.warn("[product] 编辑请求未携带任何 skuId，本次将按新增处理并软删既有 SKU（"
+                    + "skuId 保留能力不生效）spuId={} 入参行数={}，请前端补传 skuId", spu.getId(), inputs.size());
+        }
+        Set<Long> touched = new LinkedHashSet<>();
+        List<Sku> result = new ArrayList<>(inputs.size());
+        for (SkuInput in : inputs) {
+            boolean isNew = in.skuId() == null;
+            Sku sku;
+            if (isNew) {
+                sku = new Sku();
+                sku.setId(idGenerator.nextId());
+                sku.setSpuId(spu.getId());
+            } else {
+                sku = requireOwnedSku(owned, in.skuId());
+                touched.add(in.skuId());
+            }
+            applySkuInput(spu, sku, in, isNew);
+            result.add(skuRepo.save(sku));
+        }
+        // 请求未携带的既有 SKU：软删（保留行数据供对账/售后追溯；物理删会让订单/库存/价格出现悬空引用）
+        for (Sku s : owned.values()) {
+            if (!touched.contains(s.getId()) && !s.isDeleted()) {
+                log.warn("[product] SKU 未随请求提交，已软删除 spuId={} skuId={} skuCode={}",
+                        s.getSpuId(), s.getId(), s.getSkuCode());
+                s.setDeleted(true);
+                s.setStatus(ShelfStatus.OFF_SHELF.getValue());
+                skuRepo.save(s);
+            }
+        }
+        return result;
+    }
+
+    /** skuId 必须落在本商品的 SKU 集合内：跨商品 id / 不存在的 id 一律拒绝，杜绝静默覆盖他人 SKU。 */
+    private Sku requireOwnedSku(Map<Long, Sku> owned, Long skuId) {
+        Sku sku = owned.get(skuId);
+        if (sku == null) {
+            throw new BizException(BizErrorCode.PARAM_ERROR, "skuId 不存在或不属于该商品: " + skuId);
+        }
+        if (sku.isDeleted()) {
+            throw new BizException(BizErrorCode.PARAM_ERROR, "SKU 已被删除，请刷新后重试 skuId=" + skuId);
+        }
+        return sku;
+    }
+
+    /**
+     * 把入参落到 SKU 实体 —— <b>「未携带即保留」</b>语义（编辑安全性的核心）。
+     *
+     * <p>仅在「新增行」或「显式传值」时写字段：管理端详情对无 cost:read 的角色把 costPrice 脱敏为 null，
+     * 原全量替换实现会把这类角色的每次编辑都变成「抹掉成本价」；title/skuCode/images 同理不得被缺省值覆盖。</p>
+     */
+    private void applySkuInput(Spu spu, Sku sku, SkuInput in, boolean isNew) {
+        sku.setSpuId(spu.getId());
+        if (isNew || notBlank(in.skuCode())) {
+            sku.setSkuCode(notBlank(in.skuCode()) ? in.skuCode().trim() : "sku-" + idGenerator.nextId());
+        }
+        if (isNew || notBlank(in.title())) {
+            sku.setTitle(notBlank(in.title()) ? in.title().trim()
+                    : spu.getName() + " " + summarizeSpec(in.spec()));
+        }
+        sku.setSpec(toJson(in.spec())); // spec 必填（ProductDtos 校验），始终覆盖
+        if (in.images() != null) {
+            sku.setImages(in.images());
+        } else if (isNew) {
+            sku.setImages(spu.getMainImage());
+        }
+        if (in.costPrice() != null) {
+            sku.setCostPrice(in.costPrice()); // 成本价：仅显式传值才更新，null = 保留库中原值
+        } else if (isNew) {
+            sku.setCostPrice(null);
+        }
+        if (isNew) {
+            sku.setStatus(spu.getShelfStatus()); // 新 SKU 随 SPU 上下架；既有 SKU 保留其独立的上下架状态
+            sku.setDeleted(false);
+        }
+    }
+
+    private static boolean notBlank(String s) {
+        return s != null && !s.isBlank();
     }
 
     private void setSkuStatus(Long spuId, int status) {
@@ -498,24 +602,22 @@ public class ProductService {
         }
     }
 
-    /** 价格同步到 core-price（内部批量写价契约；容错降级，见 PriceClient）。 */
-    private void syncPricesToPriceService(Spu spu, List<SkuInput> inputs) {
-        List<Sku> saved = skuRepo.findBySpuIdAndDeletedFalseOrderBySkuCodeAsc(spu.getId());
-        List<SkuPriceView> views = new ArrayList<>();
-        // saveSkus 与输入按序一一对应；优先按 skuCode 匹配（乱序防御）
-        Map<String, SkuInput> byCode = new HashMap<>();
-        for (SkuInput in : inputs) {
-            if (in.skuCode() != null && !in.skuCode().isBlank()) {
-                byCode.put(in.skuCode().trim(), in);
-            }
+    /**
+     * 价格同步到 core-price（内部批量写价契约；容错降级，见 PriceClient）。
+     *
+     * @param merged 由 {@link #insertSkus}/{@link #mergeSkus} 返回，与 {@code inputs} <b>同序等长</b>
+     */
+    private void syncPricesToPriceService(List<Sku> merged, List<SkuInput> inputs) {
+        if (merged.size() != inputs.size()) {
+            // 不变式破坏属编程错误，宁可失败也不把 A 行的价格写到 B 的 skuId 上
+            throw new IllegalStateException("SKU 合并结果与入参行数不一致: merged=" + merged.size()
+                    + " inputs=" + inputs.size());
         }
-        for (int i = 0; i < saved.size(); i++) {
-            Sku sku = saved.get(i);
-            SkuInput in = i < inputs.size() ? byCode.getOrDefault(sku.getSkuCode(), inputs.get(i)) : null;
-            if (in != null) {
-                views.add(new SkuPriceView(sku.getId(), in.price(),
-                        in.marketPrice() == null ? in.price() : in.marketPrice()));
-            }
+        List<SkuPriceView> views = new ArrayList<>(merged.size());
+        for (int i = 0; i < merged.size(); i++) {
+            SkuInput in = inputs.get(i);
+            views.add(new SkuPriceView(merged.get(i).getId(), in.price(),
+                    in.marketPrice() == null ? in.price() : in.marketPrice()));
         }
         priceClient.syncSkuPrices(views);
     }

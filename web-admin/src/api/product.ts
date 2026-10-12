@@ -273,6 +273,10 @@ export async function updateProduct(id: number, data: ProductUpdateParams): Prom
       // core-price 约束 marketPrice ≥ price，否则整批同步被拒（fail-safe 仅告警）→ 改高价时须同步抬 marketPrice
       const market = current?.marketPrice ?? price;
       return {
+        // 必须回传 skuId：后端按 id 合并更新。不带 = 视为新增行 → 既有 SKU 被软删，
+        // 且 core-price / core-inventory 按旧 skuId 的绑定会指向不存在的 SKU。
+        // 新增行（表单新建，skuId 为 0/缺失）则省略该 key，传 0 会被服务端判「不存在」。
+        ...(sku.skuId > 0 ? { skuId: sku.skuId } : {}),
         skuCode: sku.skuCode,
         title: sku.title,
         spec: sku.specs,
