@@ -65,18 +65,23 @@ jobs:
       SMOKE_DEVICE: ''
     steps:
       - uses: actions/checkout@v4
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
 
       - name: 注入运行时变量
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         # WORK 走 $RUNNER_TEMP（GitHub 为每个 job 分配的临时目录），比写死 /tmp 更稳；
         # SMOKE_DEVICE 仅手动触发时有值，其余触发方式保持空串 → 后面自动挑机型。
         run: |
+          # ⚠️ $GITHUB_ENV 只对**后续步骤**生效：本步骤内 $WORK 仍是空串，
+          #    所以这里必须直接用 $RUNNER_TEMP 建目录，不能写 mkdir -p "$WORK"。
           echo "WORK=$RUNNER_TEMP/ios-smoke" >> "$GITHUB_ENV"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "SMOKE_DEVICE=${{ inputs.device }}" >> "$GITHUB_ENV"
           fi
-          mkdir -p "$WORK"
+          mkdir -p "$RUNNER_TEMP/ios-smoke/state"
 
       - name: 准备 xcodegen
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         # 只在缺失时装：GitHub macOS 镜像已预装 xcodegen，无条件 `brew install`
         # 会白白花掉 1~2 分钟（brew 更新索引 + 反复报 already installed）。
         run: |
@@ -89,6 +94,7 @@ jobs:
           xcodegen --version
 
       - name: 生成 Xcode 工程
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         working-directory: ios-client
         run: |
           set -euo pipefail
@@ -96,6 +102,7 @@ jobs:
           xcodebuild -list -project EasyShopping.xcodeproj
 
       - name: 记录工具链与模拟器清单（排查 runner 镜像漂移用）
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         run: |
           set -uo pipefail
           mkdir -p "$WORK/state"
@@ -116,6 +123,7 @@ jobs:
       # 规则：可用（isAvailable）且名字以 iPhone 开头 → 取 runtime 版本号最大的一档。
       # ------------------------------------------------------------------
       - name: 动态挑选模拟器
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         id: pick
         run: |
           set -uo pipefail
@@ -206,6 +214,7 @@ jobs:
       # "device not booted" 或 SpringBoard 未就绪，报错与真实缺陷难以区分。
       # ------------------------------------------------------------------
       - name: 启动模拟器
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         run: |
           set -uo pipefail
           # ⚠️ GitHub 的 run 块实际是 `bash -e`，所以这里不能用 `cmd; RC=$?`：
@@ -234,6 +243,7 @@ jobs:
       # runtime 上会 install 失败。让 Xcode 用默认值最稳。
       # ------------------------------------------------------------------
       - name: 编译 .app（模拟器 SDK）
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         run: |
           set -o pipefail
           xcodebuild \
@@ -247,6 +257,7 @@ jobs:
 
       # 产物路径与标识都从构建结果里取，不写死 "Debug-iphonesimulator/EasyShopping.app"
       - name: 定位 .app 产物与 bundle id
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         if: always()
         run: |
           set -uo pipefail
@@ -319,6 +330,7 @@ jobs:
           echo 1 > "$WORK/state/app.ok"
 
       - name: 安装到模拟器
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         if: always()
         run: |
           set -uo pipefail
@@ -341,6 +353,7 @@ jobs:
       # 这样后面的存活探测、截图、日志抓取在启动失败时**照样执行**，
       # 否则最需要的那份现场反而拿不到。
       - name: 启动 App
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         if: always()
         run: |
           set -uo pipefail
@@ -394,6 +407,7 @@ jobs:
       # 这里如实降级为「进程还在 + 有截图」。要真断言需给 project.yml 加 UI test target。
       # ------------------------------------------------------------------
       - name: 存活探测（两次采样）
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         if: always()
         run: |
           set -uo pipefail
@@ -457,6 +471,7 @@ jobs:
           xcrun simctl spawn "$UDID" launchctl list 2>&1 | head -40 || true
 
       - name: 抓取崩溃证据
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         if: always()
         run: |
           set -uo pipefail
@@ -483,6 +498,7 @@ jobs:
           ls -l "$WORK/crashreports" 2>/dev/null || true
 
       - name: 截图
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         if: always()
         run: |
           set -uo pipefail
@@ -508,6 +524,7 @@ jobs:
 
       # 参考信号，不参与成败判定（原因见上面「启动即崩判定」的注释）。
       - name: 截图像素参考（弱信号，不判定）
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         if: always()
         run: |
           set -uo pipefail
@@ -565,6 +582,7 @@ jobs:
           PY
 
       - name: 打包 App 产物（排查安装失败用）
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         if: always()
         run: |
           set -uo pipefail
@@ -578,6 +596,7 @@ jobs:
 
       # 无论成败都要留住现场
       - name: 上传截图与全部日志
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -587,6 +606,7 @@ jobs:
           retention-days: 30
 
       - name: 汇总到 Job Summary
+        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
         if: always()
         run: |
           set -uo pipefail
