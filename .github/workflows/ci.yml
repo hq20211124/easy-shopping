@@ -8,9 +8,10 @@ name: CI
 # 前 5 个 job 之间无 needs 依赖，完全并行；e2e-smoke 是唯一有依赖的（needs: backend，
 # 因为它要消费 backend 打出来的 jar）。任一 job 失败不影响其它 job 产出日志/产物。
 #
-# artifact 保留期政策（2026-10-16）：一律 7 天。原先 iOS 的证据留 30 天、其余留 14 天，
-# 累积起来的 artifact 存储超过了免费额度（500 MB），正是那封「存储超标」提醒的直接来源。
-# 两个体积大头——xcodebuild 的 `.xcresult` 与模拟器里打包的 `.app`——已不再上传。
+# artifact 保留期政策（2026-10-16）：一律 7 天，`backend-jars` 例外只留 1 天。
+# 实测：80 个现存 artifact 合计 4.6 GB，其中 `backend-jars` 一项就占 4.5 GB（每个约 450 MB）。
+# 它只被**同一次运行**的 e2e-smoke 下载，跑完即无用，却是免费额度（500 MB）被撑爆的直接来源。
+# 两个 iOS 体积项（`.xcresult`、打包的 `.app`）亦不再上传。
 # 需要更久的失败现场时，临时调大对应 retention-days 即可。
 # ============================================================================
 
@@ -124,12 +125,14 @@ jobs:
 
       - name: 上传可执行 jar
         # common 是普通 jar，其余 *-0.1.0-SNAPSHOT.jar 即各服务启动包（DEV.md §2）
+        # 只服务**同一次运行**的 e2e-smoke（needs: backend + download-artifact），跑完就没用了。
+        # 它是存储的最大单项（实测约 450 MB/次），所以保留期压到最短的 1 天。
         uses: actions/upload-artifact@v4
         with:
           name: backend-jars
           path: server/**/target/*.jar
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
       - name: 上传 Surefire 测试报告
         if: always()
