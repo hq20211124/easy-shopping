@@ -7,6 +7,11 @@ name: CI
 #   - backend / frontend-web / miniprogram / android：回归网，防止改一端砸另一端
 # 前 5 个 job 之间无 needs 依赖，完全并行；e2e-smoke 是唯一有依赖的（needs: backend，
 # 因为它要消费 backend 打出来的 jar）。任一 job 失败不影响其它 job 产出日志/产物。
+#
+# artifact 保留期政策（2026-10-16）：一律 7 天。原先 iOS 的证据留 30 天、其余留 14 天，
+# 累积起来的 artifact 存储超过了免费额度（500 MB），正是那封「存储超标」提醒的直接来源。
+# 两个体积大头——xcodebuild 的 `.xcresult` 与模拟器里打包的 `.app`——已不再上传。
+# 需要更久的失败现场时，临时调大对应 retention-days 即可。
 # ============================================================================
 
 on:
@@ -124,7 +129,7 @@ jobs:
           name: backend-jars
           path: server/**/target/*.jar
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 7
 
       - name: 上传 Surefire 测试报告
         if: always()
@@ -133,7 +138,7 @@ jobs:
           name: backend-surefire-reports
           path: server/**/target/surefire-reports/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 7
 
   # ==========================================================================
   # 2. Web 端：web-admin / web-buyer 并行（同一套 React+Vite 工具链，只是依赖不同）
@@ -300,7 +305,7 @@ jobs:
           name: app-debug.apk
           path: android-client/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 7
 
   # ==========================================================================
   # 5. iOS（本 CI 的核心目的）
@@ -371,16 +376,17 @@ jobs:
         #  · generic/platform=iOS Simulator —— 不挑具体机型/系统版本，
         #    免去模拟器 runtime 版本漂移与启动失败，CI 只验「能不能编译过」。
 
-      - name: 上传完整构建日志与 xcresult
+      - name: 上传构建日志
         if: always()
         uses: actions/upload-artifact@v4
         with:
+          # 只留 xcodebuild.log。`.xcresult` 是这里体积的大头（动辄数百 MB），而错误摘要已由下一步
+          # 从同一份日志里汇总进 Job Summary，事后极少再需要它——2026-10-16 起不再上传。
           name: ios-build-log
           path: |
             ${{ runner.temp }}/xcodebuild.log
-            ${{ runner.temp }}/EasyShopping.xcresult
           if-no-files-found: warn
-          retention-days: 30   # macOS 额度稀缺，失败现场留久一点
+          retention-days: 7   # 原先 30 天；失败现场留一周够看了
 
       - name: 汇总编译错误到 Job Summary
         if: always()
@@ -532,7 +538,7 @@ jobs:
             server/logs/smoke-ci.txt
             server/logs/start-ci.txt
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 7
 
       - name: 汇总结果到 Job Summary
         if: always()

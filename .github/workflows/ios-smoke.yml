@@ -615,18 +615,17 @@ jobs:
                    "疑似全黑/纯色（仅供参考，不参与判定）" if flat else "画面有内容"))
           PY
 
-      - name: 打包 App 产物（排查安装失败用）
-        continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
-        if: always()
-        run: |
-          set -uo pipefail
-          if [ -f "$WORK/state/app.env" ]; then . "$WORK/state/app.env"; fi
-          if [ -z "${APP_PATH:-}" ] || [ ! -d "${APP_PATH:-}" ]; then
-            echo "没有 .app 产物，跳过打包"
-            exit 0
-          fi
-          tar -czf "$WORK/EasyShopping.app.tar.gz" -C "$(dirname "$APP_PATH")" "$(basename "$APP_PATH")" \
-            && ls -lh "$WORK/EasyShopping.app.tar.gz" || true
+      # 2026-10-16 起不再把打包好的 `.app` 上传（体积大、是 artifact 存储超标的大头之一）；
+      # 截图与全部日志照旧保留。需要复现「装不进模拟器」时，把下面这步临时加回来即可：
+      #   - name: 打包 App 产物（排查安装失败用）
+      #     continue-on-error: true
+      #     if: always()
+      #     run: |
+      #       set -uo pipefail
+      #       if [ -f "$WORK/state/app.env" ]; then . "$WORK/state/app.env"; fi
+      #       if [ -z "${APP_PATH:-}" ] || [ ! -d "${APP_PATH:-}" ]; then echo "没有 .app 产物，跳过打包"; exit 0; fi
+      #       tar -czf "$WORK/EasyShopping.app.tar.gz" -C "$(dirname "$APP_PATH")" "$(basename "$APP_PATH")" \
+      #         && ls -lh "$WORK/EasyShopping.app.tar.gz" || true
 
       # 无论成败都要留住现场
       - name: 上传截图与全部日志
@@ -637,7 +636,7 @@ jobs:
           name: ios-smoke-evidence-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ios-smoke/
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 7   # 原先 30 天
 
       - name: 汇总到 Job Summary
         continue-on-error: true  # 早期失败也要保住现场证据，成败由最后一步统一判定
