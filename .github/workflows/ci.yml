@@ -36,6 +36,28 @@ concurrency:
 
 jobs:
   # ==========================================================================
+  # 0. 变更判定：iOS 相关文件没动，就别开 macOS runner
+  #    macOS 在私有仓库按 10 倍计费（≈ 200 分钟额度），是本文件里最贵的一项。
+  #    本 job 只做判定，跑在免费的 ubuntu 上；ios-macos 用它的输出来决定开不开。
+  # ==========================================================================
+  changes:
+    name: changes (ios-client 是否变更)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      ios: ${{ steps.filter.outputs.ios }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            ios:
+              - 'ios-client/**'
+
+  # ==========================================================================
   # 1. 后端：server/ 13 个 Maven 模块，JDK 17
   # ==========================================================================
   backend:
@@ -288,7 +310,12 @@ jobs:
   # ==========================================================================
   ios-macos:
     name: ios-macos (xcodebuild)
-    if: ${{ !inputs.skip_ios }}
+    needs: [changes]
+    # macOS runner 按 10 倍计费，是私有仓库里最贵的一项。只在两种情况下开：
+    #   · 手动触发（workflow_dispatch）——由 skip_ios 输入决定；
+    #   · push / PR 且确实动了 ios-client/**——由上面的 changes job 判定。
+    # 也就是说，改 server/、web/、文档不再顺带烧一次 macOS。
+    if: ${{ !inputs.skip_ios && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.ios == 'true') }}
     runs-on: macos-15
     timeout-minutes: 45
     steps:

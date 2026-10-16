@@ -35,11 +35,9 @@ on:
       - 'ios-client/**'
       - '.github/workflows/ios-smoke.yml'
 
-  # 每周一次（周一 UTC 18:23，避开整点的排队高峰）：paths 过滤管不到
-  # 「runner 镜像 / Xcode / 模拟器 runtime 漂移」这类外部变化，定时跑一次兜底。
-  # 代价约 15 分钟/次 ≈ 60 分钟/月。额度不足时删掉这一段即可，不影响其它触发方式。
-  schedule:
-    - cron: '23 18 * * 1'
+  # 每周一次的定时跑已于 2026-10-16 移除：它约花 60 macOS 分钟/月，而 macOS 在私有仓库按
+  # 10 倍计（2,000 分钟额度 ≈ 200 macOS 分钟），是额度被烧穿的来源之一。需要兜底时用上面的
+  # workflow_dispatch 手动触发即可；要恢复就把 `schedule: - cron: '23 18 * * 1'` 加回去。
 
 # 最小权限：只读代码仓
 permissions:
